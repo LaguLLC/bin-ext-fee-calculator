@@ -305,8 +305,13 @@ def render_results(results, events, num_bins, customer, delivery_dates,
                 st.write(line)
 
     if customer.strip():
-        add_to_history(customer.strip(), delivery_dates, events, results)
-        st.info(f"✅ Saved to history under: **{customer.strip()}**")
+        # Only save to history once per calculation (not on every rerun)
+        if not st.session_state.get("last_results", {}).get("saved_to_history", False):
+            add_to_history(customer.strip(), delivery_dates, events, results)
+            st.session_state["last_results"]["saved_to_history"] = True
+            st.info(f"✅ Saved to history under: **{customer.strip()}**")
+        else:
+            st.caption(f"📌 Already saved to history under: **{customer.strip()}**")
     else:
         st.caption("ℹ️ Customer name was blank — not saved to history.")
 
@@ -358,6 +363,11 @@ with tab1:
     col_a, col_b = st.columns([1, 1])
     with col_a:
         customer = st.text_input("Customer name (leave blank to skip saving to history)", "")
+
+        if "last_results" in st.session_state:
+            if st.button("🗑️ Clear results", help="Reset to start a new calculation"):
+                del st.session_state["last_results"]
+                st.rerun()
     with col_b:
         staggered_delivery = st.checkbox(
             "Bins delivered on different dates?",
@@ -611,10 +621,18 @@ with tab1:
                 results = calculate_allocations(
                     delivery_dates, free_days, rate, events, fixed, int(num_bins)
                 )
-                render_results(
-                    results, events, num_bins, customer, delivery_dates,
-                    show_tree, fixed, free_days, rate
-                )
+                # Save everything render_results needs to session state
+                st.session_state["last_results"] = {
+                    "results": results,
+                    "events": events,
+                    "num_bins": int(num_bins),
+                    "customer": customer,
+                    "delivery_dates": dict(delivery_dates),
+                    "fixed": dict(fixed),
+                    "free_days": free_days,
+                    "rate": rate,
+                    "saved_to_history": False,
+                }
 
     else:
         n_events = st.number_input(
@@ -697,11 +715,33 @@ with tab1:
                 results = calculate_allocations(
                     delivery_dates, free_days, rate, events, fixed, int(num_bins)
                 )
-                render_results(
-                    results, events, num_bins, customer, delivery_dates,
-                    show_tree, fixed, free_days, rate
-                )
+                st.session_state["last_results"] = {
+                    "results": results,
+                    "events": events,
+                    "num_bins": int(num_bins),
+                    "customer": customer,
+                    "delivery_dates": dict(delivery_dates),
+                    "fixed": dict(fixed),
+                    "free_days": free_days,
+                    "rate": rate,
+                    "saved_to_history": False,
+                }
 
+    # Render the latest results outside the Calculate button block
+    # so the page stays populated when user interacts with scenario dropdown
+    if "last_results" in st.session_state:
+        cached = st.session_state["last_results"]
+        render_results(
+            cached["results"],
+            cached["events"],
+            cached["num_bins"],
+            cached["customer"],
+            cached["delivery_dates"],
+            show_tree,
+            cached["fixed"],
+            cached["free_days"],
+            cached["rate"],
+        )
 
 with tab2:
     st.header("📚 Customer history")
