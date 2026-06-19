@@ -1251,4 +1251,246 @@ with tab1:
 
                     if return_date != haul:
                         st.session_state[override_key] = True
-                    elif return_date == haul
+                    elif return_date == haul and has_override:
+                        st.session_state[override_key] = False
+                else:
+                    return_date = haul
+                    st.markdown("_(rental ends — no return date)_")
+
+            with c4:
+                bin_choice = st.selectbox("Bin (if known)", bin_options, key=f"bin{i}")
+
+            if return_date < haul:
+                errors.append(
+                    f"Event {i+1}: Return date ({return_date}) is before haul date ({haul})."
+                )
+
+            events.append({
+                "label": haul.strftime("%b %d"),
+                "haul_date": haul,
+                "return_date": return_date,
+                "type": TYPE_DISPLAY.get(ev_type, SERVICE_RETURN),
+            })
+            if bin_choice != "Unknown":
+                fixed[i] = int(bin_choice.split()[-1])
+            st.divider()
+
+        if st.button(
+            "🧮 Calculate all scenarios (or press Ctrl+Enter)",
+            type="primary",
+            key="calc_picker",
+        ):
+            if errors:
+                for err in errors:
+                    st.error(err)
+            elif not events:
+                st.warning("Please add at least one event before calculating.")
+            else:
+                results = calculate_allocations(
+                    delivery_dates, free_days, rate, events, fixed, int(num_bins)
+                )
+                st.session_state["last_results"] = {
+                    "results": results,
+                    "events": events,
+                    "num_bins": int(num_bins),
+                    "customer": customer,
+                    "delivery_dates": dict(delivery_dates),
+                    "fixed": dict(fixed),
+                    "free_days": free_days,
+                    "rate": rate,
+                    "saved_to_history": False,
+                }
+
+    # Ctrl+Enter shortcut
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            if (doc._ctrlEnterAttached) return;
+            doc._ctrlEnterAttached = true;
+            doc.addEventListener('keydown', function(e) {
+                if (e.ctrlKey && e.key === 'Enter') {
+                    const buttons = doc.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        if (btn.innerText && btn.innerText.includes('Calculate all scenarios')) {
+                            btn.click();
+                            e.preventDefault();
+                            return;
+                        }
+                    }
+                }
+            });
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+    if "last_results" in st.session_state:
+        cached = st.session_state["last_results"]
+        render_results(
+            cached["results"],
+            cached["events"],
+            cached["num_bins"],
+            cached["customer"],
+            cached["delivery_dates"],
+            show_tree,
+            cached["fixed"],
+            cached["free_days"],
+            cached["rate"],
+            interchangeable,
+            show_days,
+            show_timeline,
+            hide_invalid_leaves,
+        )
+
+
+# ──────────────────────────────────────────────
+# Tab 2: History (with all enhancements)
+# ──────────────────────────────────────────────
+with tab2:
+    st.header("📚 Customer history")
+    history = load_history()
+
+    if not history:
+        st.info("No history yet. Run a calculation with a customer name filled in to start logging.")
+    else:
+        col_pick, col_recent = st.columns([2, 1])
+
+        with col_pick:
+            customers = sorted(set(h["customer"] for h in history))
+            selected_customer = st.selectbox("Choose a customer", ["(all customers)"] + customers)
+
+        with col_recent:
+            recent_n = st.number_input(
+                "Show last N records",
+                min_value=1,
+                max_value=50,
+                value=10,
+                help="Limit how many records to show for the selected customer.",
+            )
+
+        if selected_customer == "(all customers)":
+            filtered = history
+        else:
+            filtered = [h for h in history if h["customer"] == selected_customer]
+
+        # Newest first, then truncate
+        filtered = list(reversed(filtered))[:int(recent_n)]
+
+        st.write(f"Showing **{len(filtered)}** record(s) (newest first)")
+
+        rows = []
+        for h in filtered:
+            event_dates = [e["haul_date"] for e in h["events"]]
+            date_range = f"{min(event_dates)} → {max(event_dates)}" if event_dates else "—"
+
+            if "delivery_dates" in h:
+                deliveries = sorted(set(h["delivery_dates"].values()))
+                if len(deliveries) == 1:
+                    delivery_display = deliveries[0]
+                else:
+                    delivery_display = f"{deliveries[0]} → {deliveries[-1]}"
+            else:
+                delivery_display = h.get("delivery_date", "—")
+
+            min_ext = h.get("min_ext_days", None)
+            max_ext = h.get("max_ext_days", None)
+            min_fee_str = fmt_fee(h["min_total"], min_ext, show_days)
+            max_fee_str = fmt_fee(h["max_total"], max_ext, show_days)
+
+            rows.append({
+                "Customer": h["customer"],
+                "Delivery": delivery_display,
+                "Event date range": date_range,
+                "# Events": len(h["events"]),
+                "Scenarios": h["scenario_count"],
+                "Min fee": min_fee_str,
+                "Max fee": max_fee_str,
+                "Logged": h["logged_at"],
+            })
+        st.dataframe(rows, use_container_width=True)
+
+        st.divider()
+        st.subheader("🔍 View / reload a record")
+
+        if filtered:
+            idx = st.number_input(
+                "Record # to view",
+                min_value=1,
+                max_value=len(filtered),
+                value=1,
+                help="Pick a record from the table above.",
+            )
+            rec = filtered[idx - 1]
+
+            st.markdown(f"### {rec['customer']} — logged {rec.get('logged_at', '—')}")
+
+            # Static read-only view
+            render_static_view_of_record(rec, show_days)
+
+            st.divider()
+
+            # Reload into calculator
+            with st.expander("🔁 Reload into calculator"):
+                st.write("Loads this record into the Calculator tab so you can edit and recalculate.")
+                if st.button("Reload now", type="primary", key=f"reload_{idx}"):
+                    reload_record_to_calculator(rec)
+                    st.success(
+                        f"✅ Reloaded **{rec['customer']}** into the calculator. "
+                        "Switch to the **🧮 Calculator** tab to see the data."
+                    )
+
+            # Re-run with new terms
+            with st.expander("🔄 Re-run with new rental terms"):
+                st.write(
+                    "Try different free-day allowances or rates without changing the original record."
+                )
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    new_free_days = st.number_input(
+                        "New free rental days",
+                        min_value=1,
+                        value=rec.get("free_days", 10),
+                        key=f"new_fd_{idx}",
+                    )
+                with rc2:
+                    new_rate = st.number_input(
+                        "New extension rate ($)",
+                        min_value=0.0,
+                        value=float(rec.get("rate", 50.0)),
+                        key=f"new_rate_{idx}",
+                    )
+                if st.button("Re-run with new terms", key=f"rerun_{idx}"):
+                    render_rerun_results(rec, new_free_days, new_rate, show_days)
+
+            # Compare with another record
+            with st.expander("⚖️ Compare with another record"):
+                other_options = [
+                    f"{i+1}. {h['customer']} — {h.get('logged_at', '—')}"
+                    for i, h in enumerate(filtered)
+                    if i + 1 != idx
+                ]
+                if not other_options:
+                    st.info("Need at least 2 records in this filter to compare.")
+                else:
+                    other_choice = st.selectbox(
+                        "Compare with which record?",
+                        other_options,
+                        key=f"compare_{idx}",
+                    )
+                    if st.button("Show comparison", key=f"comp_btn_{idx}"):
+                        other_idx = int(other_choice.split(".")[0]) - 1
+                        other_rec = filtered[other_idx]
+                        render_record_comparison(rec, other_rec, show_days)
+
+            # Raw JSON
+            with st.expander("📄 Raw JSON"):
+                st.json(rec)
+
+        st.divider()
+        with st.expander("⚠️ Danger zone"):
+            if st.button("🗑️ Clear all history"):
+                save_history([])
+                st.success("History cleared. Refresh the page to see the empty state.")
