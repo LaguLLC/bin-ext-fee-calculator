@@ -411,14 +411,14 @@ st.caption(
         )
 
         earliest_delivery = min(delivery_dates.values())
-                # Initialize table state once per session so edits persist between reruns
-                if "events_table_df" not in st.session_state:
-                    st.session_state["events_table_df"] = pd.DataFrame({
-                        "Haul date": [earliest_delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
-                        "Type": ["S/Rtn"] * 3,
-                        "Return date": [earliest_delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
-                        "Bin (if known)": ["Unknown"] * 3,
-                    })
+        # Initialize table state once per session so edits persist between reruns
+        if "events_table_df" not in st.session_state:
+            st.session_state["events_table_df"] = pd.DataFrame({
+                "Haul date": [earliest_delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
+                "Type": ["S/Rtn"] * 3,
+                "Return date": [earliest_delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
+                "Bin (if known)": ["Unknown"] * 3,
+            })
 
         # Apply auto-sync rules before rendering:
         # - S/Rtn with blank return date -> fill with haul date
