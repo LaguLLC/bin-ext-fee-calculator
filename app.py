@@ -13,8 +13,8 @@ REPO = "repo"
 HISTORY_FILE = "history.json"
 
 TYPE_DISPLAY = {
-    "Service & return": SERVICE_RETURN,
-    "Final repo": REPO,
+    "S/Rtn": SERVICE_RETURN,
+    "S/Repo": REPO,
 }
 
 # ──────────────────────────────────────────────
@@ -134,7 +134,7 @@ def render_results(results, events, num_bins, customer, delivery):
     if not results:
         st.error(
             "No valid scenarios found. Check that each bin has at most "
-            "one Final repo event and that it's the last event for that bin."
+            "one S/Repo event and that it's the last event for that bin."
         )
         return
 
@@ -181,14 +181,35 @@ def render_results(results, events, num_bins, customer, delivery):
 # ──────────────────────────────────────────────
 # Streamlit UI
 # ──────────────────────────────────────────────
-st.set_page_config(page_title="Roll-Off Bin Fee Calculator", layout="wide")
-st.title("🚛 Roll-Off Bin Extension Fee Calculator")
+st.set_page_config(page_title="Bin Extension Fee Calculator", page_icon="🗑️", layout="wide")
+st.title("🗑️ Bin Extension Fee Calculator")
 
 tab1, tab2 = st.tabs(["🧮 Calculator", "📚 History"])
 
+# ─── Sidebar ──────────────────────────────────
 with st.sidebar:
     st.header("Rental Terms")
-    free_days = st.number_input("Free rental days per cycle", value=10, min_value=1)
+
+    rental_type = st.radio(
+        "Rental type",
+        ["Roll-off (10 free days)", "Short-term (3 free days)", "Custom"],
+        help="Pick a preset to auto-fill free days, or choose Custom to set manually.",
+    )
+
+    if rental_type == "Roll-off (10 free days)":
+        default_free_days = 10
+    elif rental_type == "Short-term (3 free days)":
+        default_free_days = 3
+    else:
+        default_free_days = 10
+
+    free_days = st.number_input(
+        "Free rental days per cycle",
+        value=default_free_days,
+        min_value=1,
+        disabled=(rental_type != "Custom"),
+        help="Locked unless you select Custom above.",
+    )
     rate = st.number_input("Extension fee per day ($)", value=50.0, min_value=0.0)
     num_bins = st.number_input("Number of bins on site", value=2, min_value=1, max_value=5)
     st.caption("Off-site days (between haul and return) are not billed.")
@@ -202,6 +223,7 @@ with tab1:
         delivery = st.date_input("Delivery date", value=date.today() - timedelta(days=30))
 
     st.subheader("Events")
+    st.caption("**S/Rtn** = Service & return (bin comes back) | **S/Repo** = Service & repo (rental ends)")
 
     input_mode = st.radio(
         "Input mode",
@@ -225,13 +247,13 @@ with tab1:
             "Add rows with the **➕** button below the table, or delete with the trash icon."
         )
         st.caption(
-            "Excel column format — Haul date: `YYYY-MM-DD` | Type: `Service & return` or `Final repo` | "
+            "Excel column format — Haul date: `YYYY-MM-DD` | Type: `S/Rtn` or `S/Repo` | "
             "Return date: `YYYY-MM-DD` (blank = same as haul) | Bin: `Unknown` or `Bin 1`, `Bin 2`, etc."
         )
 
         default_df = pd.DataFrame({
             "Haul date": [delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
-            "Type": ["Service & return"] * 3,
+            "Type": ["S/Rtn"] * 3,
             "Return date": [delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
             "Bin (if known)": ["Unknown"] * 3,
         })
@@ -249,13 +271,13 @@ with tab1:
                 ),
                 "Type": st.column_config.SelectboxColumn(
                     "Type",
-                    help="Service & return = bin returns; Final repo = rental ends",
+                    help="S/Rtn = bin returns; S/Repo = rental ends",
                     options=type_options,
                     required=True,
                 ),
                 "Return date": st.column_config.DateColumn(
                     "Return date",
-                    help="Date bin was returned. Same as haul for same-day. Ignored for Final repo.",
+                    help="Date bin was returned. Same as haul for same-day. Ignored for S/Repo.",
                     format="YYYY-MM-DD",
                 ),
                 "Bin (if known)": st.column_config.SelectboxColumn(
@@ -280,7 +302,7 @@ with tab1:
                 if hasattr(haul, "date"):
                     haul = haul.date()
 
-                if ev_type == "Final repo":
+                if ev_type == "S/Repo":
                     return_date = haul
                 else:
                     if pd.isna(return_date):
@@ -339,7 +361,7 @@ with tab1:
                     key=f"type{i}",
                 )
             with c3:
-                if ev_type == "Service & return":
+                if ev_type == "S/Rtn":
                     return_date = st.date_input("Return date", key=f"ret{i}", value=haul)
                 else:
                     return_date = haul
