@@ -58,7 +58,8 @@ def is_valid_assignment(events, assignment, delivery_dates):
         if repo_idx and repo_idx[0] != len(bin_events) - 1:
             return False
         for e in bin_events:
-            if e["haul_date"] < delivery_datesreturn False
+            if e["haul_date"] < delivery_dates[b]:
+                return False
     return True
 
 
