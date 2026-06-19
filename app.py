@@ -78,14 +78,23 @@ def is_valid_assignment(events, assignment, delivery_dates):
 
 
 def deduplicate_scenarios(results):
-    """Collapse symmetric scenarios (same set of events per bin, regardless of which bin number)."""
+    """
+    Collapse only TRULY identical scenarios — same canonical bin assignment
+    AND same total fee AND same per-bin fee distribution.
+    Correctly handles:
+    - Identical duplicate events -> deduped
+    - Staggered delivery where bin swap produces different totals -> NOT deduped
+    - Same-day delivery where bin swap is truly symmetric -> deduped
+    """
     seen = {}
     for r in results:
         bin_sets = []
         for b in sorted(r["assignment"].keys()):
             event_tuple = tuple(sorted(r["assignment"][b]))
             bin_sets.append(event_tuple)
-        canonical = tuple(sorted(bin_sets))
+        canonical_events = tuple(sorted(bin_sets))
+        fee_tuple = tuple(sorted(r["fees"].values()))
+        canonical = (canonical_events, fee_tuple, r["total"])
         if canonical not in seen:
             seen[canonical] = r
     deduped = sorted(seen.values(), key=lambda x: x["total"])
@@ -123,7 +132,6 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
             )
         total = sum(fees.values())
 
-        # Total extension days across all bins
         total_ext_days = 0
         for b in breakdowns:
             for c in breakdowns[b]:
@@ -143,11 +151,10 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
 
 
 # ──────────────────────────────────────────────
-# Decision tree (Graphviz DOT)
+# Decision tree (Graphviz DOT) — days only, no dollars
 # ──────────────────────────────────────────────
 def compute_edge_ext_days(events, partial_assignment, target_idx, bin_num,
                           delivery_dates, free_days):
-    """Compute the extension days added when target_idx event is routed to bin_num."""
     bin_events = []
     target_haul = events[target_idx]["haul_date"]
     for i, ev in enumerate(events):
@@ -174,7 +181,12 @@ def compute_edge_ext_days(events, partial_assignment, target_idx, bin_num,
 
 
 def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
-                            free_days, rate_per_day, show_days=True):
+                            free_days, rate_per_day, highlight_combo=None):
+    """
+    Tree shows DAYS ONLY (no dollar amounts) to reduce visual clutter.
+    Per-bin breakdown shown inside leaf nodes.
+    Highlighted path uses bright green styling.
+    """
     free_indices = [i for i in range(len(events)) if i not in fixed_assignments]
 
     if not free_indices:
@@ -186,12 +198,21 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
     lines.append('  node [shape=box, style="rounded,filled", fillcolor=white, fontname="Arial"];')
     lines.append('  edge [fontname="Arial", fontsize=10];')
 
-    fixed_parts = []
-    for idx, b in fixed_assignments.items():
-        lbl = events[idx]["label"]
-        fixed_parts.append(f"{lbl}=B{b}")
-    fixed_summary = ", ".join(fixed_parts) if fixed_parts else "no fixed events"
-    root_label = "Start\\n(" + fixed_summary + ")"
+    # Build Start node with delivery dates and fixed events
+    start_parts = []
+    for b in sorted(delivery_dates.keys()):
+        d = delivery_dates[b]
+        start_parts.append(f"Bin {b} delivered {d}")
+    if fixed_assignments:
+        for idx, b in fixed_assignments.items():
+            lbl = events[idx]["label"]
+            start_parts.append(f"{lbl} locked to Bin {b}")
+    start_text = "\\n".join(start_parts) if start_parts else "no fixed events"
+    first_service_label = events[free_indices[0]]["label"]
+    root_label = (
+        f"Start\\n{start_text}\\n\\n"
+        f"First decision: which bin handled {first_service_label}?"
+    )
     lines.append(f'  root [label="{root_label}", shape=ellipse, fillcolor="#cfe2ff"];')
 
     node_counter = [0]
@@ -206,12 +227,12 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
         ev_label = events[idx]["label"]
         is_last = (depth == len(free_indices) - 1)
         next_frontier = {}
+
         for partial, parent_id in frontier.items():
             for bin_num in range(1, num_bins + 1):
                 new_partial = partial + (bin_num,)
                 nid = new_id()
 
-                # Build a partial assignment up to this point for edge ext days
                 edge_assignment = dict(fixed_assignments)
                 for fi, bn in zip(free_indices[:depth + 1], new_partial):
                     edge_assignment[fi] = bn
@@ -219,6 +240,14 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
                 edge_ext = compute_edge_ext_days(
                     events, edge_assignment, idx, bin_num, delivery_dates, free_days
                 )
+
+                on_highlight_path = False
+                if highlight_combo is not None and len(highlight_combo) >= depth + 1:
+                    matches = all(
+                        new_partial[i] == highlight_combo[i]
+                        for i in range(depth + 1)
+                    )
+                    on_highlight_path = matches
 
                 if is_last:
                     full_assignment = dict(fixed_assignments)
@@ -231,39 +260,115 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
                             bins_map[full_assignment[i]].append(ev)
                         for b in bins_map:
                             bins_map[b].sort(key=lambda e: e["haul_date"])
-                        total = 0
+
+                        per_bin_ext = {}
                         total_ext = 0
                         for b in bins_map:
                             bin_delivery = delivery_dates.get(b)
-                            f, bd = fee_for_bin(bins_map[b], bin_delivery, free_days, rate_per_day)
-                            total += f
-                            for c in bd:
-                                total_ext += c["ext_days"]
-                        if show_days:
-                            leaf_label = f"Total: ${total:,.0f}\\n({total_ext}d)"
+                            _, bd = fee_for_bin(bins_map[b], bin_delivery, free_days, rate_per_day)
+                            ext_sum = sum(c["ext_days"] for c in bd)
+                            per_bin_ext[b] = ext_sum
+                            total_ext += ext_sum
+
+                        # Days-only leaf label
+                        leaf_lines = [f"Total: {total_ext}d"]
+                        for b in sorted(bins_map.keys()):
+                            leaf_lines.append(f"B{b}: {per_bin_ext[b]}d")
+                        leaf_label = "\\n".join(leaf_lines)
+
+                        if on_highlight_path:
+                            fill = "#28a745"
+                            node_extras = ', fontcolor="white", penwidth=3'
                         else:
-                            leaf_label = f"Total: ${total:,.0f}"
-                        lines.append(f'  {nid} [label="{leaf_label}", fillcolor="#d1e7dd"];')
+                            fill = "#d1e7dd"
+                            node_extras = ""
+                        lines.append(f'  {nid} [label="{leaf_label}", fillcolor="{fill}"{node_extras}];')
                     else:
                         lines.append(f'  {nid} [label="(invalid)", fillcolor="#f8d7da"];')
                 else:
                     next_idx = free_indices[depth + 1]
                     next_lbl = events[next_idx]["label"]
-                    node_label = "Service " + next_lbl + " -> ?"
-                    lines.append(f'  {nid} [label="{node_label}"];')
+                    node_label = f"Which bin handled\\n{next_lbl}?"
+                    if on_highlight_path:
+                        lines.append(f'  {nid} [label="{node_label}", fillcolor="#fff3cd", penwidth=2];')
+                    else:
+                        lines.append(f'  {nid} [label="{node_label}"];')
 
                 if edge_ext > 0:
-                    edge_label = f"Bin {bin_num} (+{edge_ext}d)"
+                    edge_label = f"{ev_label} -> Bin {bin_num}\\n+{edge_ext}d"
                 else:
-                    edge_label = f"Bin {bin_num}"
+                    edge_label = f"{ev_label} -> Bin {bin_num}"
 
-                lines.append(f'  {parent_id} -> {nid} [label="  {edge_label}  "];')
+                if on_highlight_path:
+                    edge_extras = ', color="#28a745", penwidth=3, fontcolor="#28a745"'
+                else:
+                    edge_extras = ""
+                lines.append(f'  {parent_id} -> {nid} [label="  {edge_label}  "{edge_extras}];')
                 next_frontier[new_partial] = nid
 
         frontier = next_frontier
 
-    lines.append('  info [label="Each branch = which bin handled that service.\\n+Nd on arrow = extension days added.", shape=note, fillcolor="#fff3cd"];')
-    lines.append("  info -> root [style=invis];")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def build_timeline_view(scenario, num_bins, delivery_dates, free_days):
+    """Per-bin timeline as a Graphviz DOT diagram with horizontal swim lanes."""
+    lines = []
+    lines.append("digraph Timeline {")
+    lines.append("  rankdir=LR;")
+    lines.append('  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=11];')
+    lines.append('  edge [fontname="Arial", fontsize=9];')
+
+    for b in range(1, int(num_bins) + 1):
+        bin_breakdown = scenario["breakdowns"][b]
+        bin_total = scenario["fees"][b]
+        bin_ext = sum(c["ext_days"] for c in bin_breakdown)
+        bin_delivery = delivery_dates.get(b)
+
+        lines.append(f'  subgraph cluster_bin{b} {{')
+        lines.append(f'    label="Bin {b}: ${bin_total:,.0f} ({bin_ext}d ext)";')
+        lines.append(f'    style="rounded,filled";')
+        lines.append(f'    fillcolor="#f8f9fa";')
+        lines.append(f'    fontname="Arial";')
+        lines.append(f'    fontsize=12;')
+
+        del_id = f"d{b}"
+        lines.append(f'    {del_id} [label="Delivered\\n{bin_delivery}", fillcolor="#cfe2ff", shape=ellipse];')
+
+        prev_id = del_id
+        if not bin_breakdown:
+            empty_id = f"e{b}"
+            lines.append(f'    {empty_id} [label="(no services)", fillcolor="white", style="dashed,filled"];')
+            lines.append(f'    {prev_id} -> {empty_id} [style=invis];')
+        else:
+            for i, c in enumerate(bin_breakdown):
+                evt_id = f"b{b}c{i}"
+                cycle_days = c["cycle_days"]
+                ext_days = c["ext_days"]
+                fee = c["fee"]
+                haul = c["haul_date"]
+
+                if ext_days > 0:
+                    fill = "#fff3cd"
+                    extras = f"\\n+{ext_days}d ext = ${fee:,.0f}"
+                else:
+                    fill = "#d1e7dd"
+                    extras = ""
+
+                evt_label = f"Service\\n{haul}\\n{cycle_days}d cycle{extras}"
+                lines.append(f'    {evt_id} [label="{evt_label}", fillcolor="{fill}"];')
+
+                edge_label = f"{cycle_days}d"
+                if ext_days > 0:
+                    edge_extras = ', color="#dc3545", penwidth=2'
+                else:
+                    edge_extras = ""
+                lines.append(f'    {prev_id} -> {evt_id} [label="{edge_label}"{edge_extras}];')
+                prev_id = evt_id
+
+        lines.append("  }")
+
     lines.append("}")
     return "\n".join(lines)
 
@@ -316,7 +421,7 @@ def add_to_history(customer, delivery_dates, events, results):
 # ──────────────────────────────────────────────
 def render_results(results, events, num_bins, customer, delivery_dates,
                    show_tree, fixed_assignments, free_days, rate_per_day,
-                   interchangeable, show_days):
+                   interchangeable, show_days, show_timeline):
     if not results:
         st.error(
             "No valid scenarios found. Check that each bin has at most one "
@@ -325,14 +430,13 @@ def render_results(results, events, num_bins, customer, delivery_dates,
         )
         return
 
-    # Apply dedupe if requested
     removed_count = 0
     if interchangeable:
         results, removed_count = deduplicate_scenarios(results)
 
     msg = f"Found {len(results)} valid scenario(s) across {len(events)} event(s)."
     if removed_count > 0:
-        msg += f" Hid {removed_count} symmetric duplicate(s) (bins interchangeable)."
+        msg += f" Hid {removed_count} duplicate(s) (same total + same bin distribution)."
     st.success(msg)
 
     lowest = results[0]["total"]
@@ -354,45 +458,67 @@ def render_results(results, events, num_bins, customer, delivery_dates,
             row[f"Bin {b}"] = ", ".join(services_list) if services_list else "(none)"
         for b in range(1, int(num_bins) + 1):
             bin_fee = r["fees"][b]
-            bin_ext = 0
-            for c in r["breakdowns"][b]:
-                bin_ext += c["ext_days"]
+            bin_ext = sum(c["ext_days"] for c in r["breakdowns"][b])
             row[f"Bin {b} Fee"] = fmt_fee(bin_fee, bin_ext, show_days)
         row["Total"] = fmt_fee(r["total"], r.get("total_ext_days", 0), show_days)
         table_rows.append(row)
     st.dataframe(table_rows, use_container_width=True)
-
-    if show_tree:
-        st.subheader("🌳 Decision tree")
-        st.caption(
-            "Each path from Start to a leaf is one scenario. "
-            "Edge labels show which bin handled each service and the extension days added. "
-            "Tree shows ALL permutations (including symmetric duplicates) even when dedupe is on."
-        )
-        dot = build_decision_tree_dot(
-            events, fixed_assignments, num_bins, delivery_dates,
-            free_days, rate_per_day, show_days,
-        )
-        if dot is None:
-            st.info("No decisions to display — all events are locked to specific bins.")
-        else:
-            try:
-                st.graphviz_chart(dot, use_container_width=True)
-            except Exception as ex:
-                st.warning(f"Could not render decision tree: {ex}")
 
     st.subheader("📋 Scenario breakdown")
     choice = st.selectbox(
         "View detailed cycle math for scenario:",
         list(range(1, len(results) + 1)),
     )
-    r = results[choice - 1]
+    selected_scenario = results[choice - 1]
+
+    if show_tree:
+        st.subheader("🌳 Decision tree")
+        dot = build_decision_tree_dot(
+            events, fixed_assignments, num_bins, delivery_dates,
+            free_days, rate_per_day,
+            highlight_combo=selected_scenario.get("combo"),
+        )
+        if dot is None:
+            st.info("No decisions to display — all events are locked to specific bins.")
+        else:
+            try:
+                st.graphviz_chart(dot, use_container_width=True)
+                st.markdown(
+                    """
+**🗺️ Tree legend**
+
+- 🔵 **Blue oval** = Start (shows delivery dates + locked bins)
+- ⬜ **White boxes** = "Which bin?" decision points
+- 🟢 **Light green boxes** = valid leaf (total + per-bin extension days)
+- 🔴 **Pink boxes** = invalid (event predates bin's delivery, or duplicate repo)
+- 🟩 **Bright green path** = the scenario currently selected above (pick a different scenario to re-highlight)
+- **Arrow labels:** "Service date → Bin N" with **+Nd** showing extension days added by that routing
+- **Tree shows days only** (dollar amounts in scenario table + per-bin breakdown below)
+- Both bins appear in one tree because every decision affects both
+                    """
+                )
+            except Exception as ex:
+                st.warning(f"Could not render decision tree: {ex}")
+
+    if show_timeline:
+        st.subheader("📅 Per-bin timeline (for selected scenario)")
+        st.caption(
+            "Each bin shown as a horizontal sequence: Delivery → Service → Service. "
+            "Yellow boxes = cycles with extension days. Green boxes = within free days. "
+            "Red arrows highlight cycles that ran over."
+        )
+        timeline_dot = build_timeline_view(
+            selected_scenario, num_bins, delivery_dates, free_days
+        )
+        try:
+            st.graphviz_chart(timeline_dot, use_container_width=True)
+        except Exception as ex:
+            st.warning(f"Could not render timeline: {ex}")
+
     for b in range(1, int(num_bins) + 1):
-        bin_fee = r["fees"][b]
-        bin_breakdown = r["breakdowns"][b]
-        bin_ext_total = 0
-        for c in bin_breakdown:
-            bin_ext_total += c["ext_days"]
+        bin_fee = selected_scenario["fees"][b]
+        bin_breakdown = selected_scenario["breakdowns"][b]
+        bin_ext_total = sum(c["ext_days"] for c in bin_breakdown)
         header = f"Bin {b} — {fmt_fee(bin_fee, bin_ext_total, show_days)}"
         with st.expander(header):
             if not bin_breakdown:
@@ -458,17 +584,22 @@ with st.sidebar:
     show_tree = st.checkbox(
         "🌳 Show decision tree",
         value=False,
-        help="Renders a Graphviz tree of all allocation possibilities.",
+        help="Tree showing all allocation possibilities (days-only labels to reduce clutter).",
+    )
+    show_timeline = st.checkbox(
+        "📅 Show per-bin timeline",
+        value=False,
+        help="Alternative view: each bin as its own horizontal swim lane (Delivery → Service → Service).",
     )
     show_days = st.checkbox(
         "📊 Show days alongside dollars",
         value=True,
-        help="Adds extension day counts next to dollar amounts (e.g., $600 (12d)).",
+        help="Adds extension day counts next to dollar amounts in tables/metrics (e.g., $600 (12d)).",
     )
     interchangeable = st.checkbox(
-        "🔁 Bins are interchangeable (same size/type)",
+        "🔁 Hide duplicate scenarios",
         value=True,
-        help="Hide symmetric duplicate scenarios when bins differ only by label. Turn OFF if bins are different sizes or were delivered on different days.",
+        help="Collapse scenarios with identical totals and bin-fee distributions. Safe to leave ON — won't merge scenarios with truly different outcomes (e.g., staggered delivery).",
     )
 
 
@@ -576,7 +707,6 @@ with tab1:
             key="events_table",
         )
 
-        # Apply auto-sync rules AFTER the user's edit
         sync_state = st.session_state["row_sync_state"]
         previous_df = st.session_state["events_table_df"]
         changed = False
@@ -633,7 +763,6 @@ with tab1:
                         sync_state[idx] = True
                         changed = True
 
-        # Build error column
         synced_df["⚠️"] = ""
         for idx in synced_df.index:
             row_type = synced_df.at[idx, "Type"]
@@ -647,7 +776,6 @@ with tab1:
             ):
                 synced_df.at[idx, "⚠️"] = "⚠️ Return before haul"
 
-        # Save synced version (without warning column)
         df_to_save = synced_df.copy()
         if "⚠️" in df_to_save.columns:
             df_to_save = df_to_save.drop(columns=["⚠️"])
@@ -816,7 +944,6 @@ with tab1:
                     "saved_to_history": False,
                 }
 
-    # Render the latest results outside the Calculate button block
     if "last_results" in st.session_state:
         cached = st.session_state["last_results"]
         render_results(
@@ -831,6 +958,7 @@ with tab1:
             cached["rate"],
             interchangeable,
             show_days,
+            show_timeline,
         )
 
 
