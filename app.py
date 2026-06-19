@@ -17,8 +17,9 @@ TYPE_DISPLAY = {
     "S/Repo": REPO,
 }
 
+
 # ──────────────────────────────────────────────
-# Core fee calculation helper
+# Core fee calculation
 # ──────────────────────────────────────────────
 def fee_for_bin(bin_events, bin_delivery_date, free_days, rate_per_day):
     if not bin_events:
@@ -45,7 +46,6 @@ def fee_for_bin(bin_events, bin_delivery_date, free_days, rate_per_day):
 
 
 def is_valid_assignment(events, assignment, delivery_dates):
-    """Check that bins have at most 1 repo (last), and no event predates its bin's delivery."""
     bins = {}
     for i, ev in enumerate(events):
         b = assignment[i]
@@ -57,8 +57,11 @@ def is_valid_assignment(events, assignment, delivery_dates):
             return False
         if repo_idx and repo_idx[0] != len(bin_events) - 1:
             return False
+        bin_start = delivery_dates.get(b)
+        if bin_start is None:
+            return False
         for e in bin_events:
-            if e["haul_date"] < delivery_dates[b]:
+            if e["haul_date"] < bin_start:
                 return False
     return True
 
@@ -87,8 +90,9 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
         fees = {}
         breakdowns = {}
         for b in bins:
+            bin_delivery = delivery_dates.get(b)
             fees[b], breakdowns[b] = fee_for_bin(
-                bins[b], delivery_dates[b], free_days, rate_per_day
+                bins[b], bin_delivery, free_days, rate_per_day
             )
         total = sum(fees.values())
 
@@ -105,7 +109,7 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
 
 
 # ──────────────────────────────────────────────
-# Decision tree (Graphviz DOT) builder
+# Decision tree (Graphviz DOT)
 # ──────────────────────────────────────────────
 def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
                             free_days, rate_per_day):
@@ -116,26 +120,24 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
 
     lines = []
     lines.append("digraph DT {")
-    lines.append('  rankdir=TB;')
+    lines.append("  rankdir=TB;")
     lines.append('  node [shape=box, style="rounded,filled", fillcolor=white, fontname="Arial"];')
     lines.append('  edge [fontname="Arial", fontsize=10];')
 
-    # Root node
-    fixed_summary_parts = []
+    fixed_parts = []
     for idx, b in fixed_assignments.items():
         lbl = events[idx]["label"]
-        fixed_summary_parts.append(f"{lbl}={chr(0x2192)}B{b}")
-    fixed_summary = ", ".join(fixed_summary_parts) if fixed_summary_parts else "no fixed events"
+        fixed_parts.append(f"{lbl}=B{b}")
+    fixed_summary = ", ".join(fixed_parts) if fixed_parts else "no fixed events"
     root_label = "Start\\n(" + fixed_summary + ")"
     lines.append(f'  root [label="{root_label}", shape=ellipse, fillcolor="#cfe2ff"];')
 
-    # BFS: build all paths
     node_counter = [0]
+
     def new_id():
         node_counter[0] += 1
         return f"n{node_counter[0]}"
 
-    # Map partial path tuple -> node id
     frontier = {(): "root"}
 
     for depth, idx in enumerate(free_indices):
@@ -148,7 +150,6 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
                 nid = new_id()
 
                 if is_last:
-                    # Leaf - compute total fee
                     full_assignment = dict(fixed_assignments)
                     for fi, bn in zip(free_indices, new_partial):
                         full_assignment[fi] = bn
@@ -161,7 +162,8 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
                             bins_map[b].sort(key=lambda e: e["haul_date"])
                         total = 0
                         for b in bins_map:
-                            f, _ = fee_for_bin(bins_map[b], delivery_dates[b], free_days, rate_per_day)
+                            bin_delivery = delivery_dates.get(b)
+                            f, _ = fee_for_bin(bins_map[b], bin_delivery, free_days, rate_per_day)
                             total += f
                         formatted_total = f"${total:,.0f}"
                         leaf_label = "Total: " + formatted_total
@@ -171,8 +173,6 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
                 else:
                     next_idx = free_indices[depth + 1]
                     next_lbl = events[next_idx]["label"]
-                    node_label = "Service " + next_lbl + "\\n\xe2\x86\x92 ?"
-                    # Use ASCII fallback for arrow inside DOT
                     node_label = "Service " + next_lbl + " -> ?"
                     lines.append(f'  {nid} [label="{node_label}"];')
 
@@ -182,10 +182,8 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
 
         frontier = next_frontier
 
-    # Add a header note above root
     lines.append('  info [label="Each branch = which bin handled that service", shape=note, fillcolor="#fff3cd"];')
-    lines.append('  info -> root [style=invis];')
-
+    lines.append("  info -> root [style=invis];")
     lines.append("}")
     return "\n".join(lines)
 
@@ -253,7 +251,6 @@ def render_results(results, events, num_bins, customer, delivery_dates,
     m2.metric("Highest total fee", f"${highest:,.0f}")
     m3.metric("Range", f"${spread:,.0f}")
 
-    # Scenario table
     table_rows = []
     for i, r in enumerate(results, 1):
         row = {"#": i}
@@ -267,13 +264,12 @@ def render_results(results, events, num_bins, customer, delivery_dates,
         table_rows.append(row)
     st.dataframe(table_rows, use_container_width=True)
 
-    # Optional decision tree
     if show_tree:
         st.subheader("🌳 Decision tree")
         st.caption(
-            "Each path from Start to a leaf represents one scenario. "
-            "Edge labels show which bin handled that service. "
-            "Use mouse wheel to zoom; click + drag to pan."
+            "Each path from Start to a leaf is one scenario. "
+            "Edge labels show which bin handled each service. "
+            "Mouse wheel to zoom; click+drag to pan."
         )
         dot = build_decision_tree_dot(
             events, fixed_assignments, num_bins, delivery_dates, free_days, rate_per_day
@@ -286,7 +282,6 @@ def render_results(results, events, num_bins, customer, delivery_dates,
             except Exception as ex:
                 st.warning(f"Could not render decision tree: {ex}")
 
-    # Drill-down
     st.subheader("📋 Scenario breakdown")
     choice = st.selectbox(
         "View detailed cycle math for scenario:",
@@ -308,7 +303,6 @@ def render_results(results, events, num_bins, customer, delivery_dates,
                 )
                 st.write(line)
 
-    # Save to history
     if customer.strip():
         add_to_history(customer.strip(), delivery_dates, events, results)
         st.info(f"✅ Saved to history under: **{customer.strip()}**")
@@ -324,7 +318,6 @@ st.title("🗑️ Bin Extension Fee Calculator")
 
 tab1, tab2 = st.tabs(["🧮 Calculator", "📚 History"])
 
-# ─── Sidebar ──────────────────────────────────
 with st.sidebar:
     st.header("Rental Terms")
 
@@ -359,7 +352,7 @@ with st.sidebar:
         help="Renders a Graphviz tree of all allocation possibilities. Can get wide for many unknowns — zoom/pan as needed.",
     )
 
-# ─── Tab 1: Calculator ────────────────────────
+
 with tab1:
     col_a, col_b = st.columns([1, 1])
     with col_a:
@@ -367,7 +360,7 @@ with tab1:
     with col_b:
         staggered_delivery = st.checkbox(
             "Bins delivered on different dates?",
-            help="Check this if bins were dropped off on separate days (e.g., bin added mid-project).",
+            help="Check if bins were dropped off on separate days (e.g., bin added mid-project).",
         )
 
     default_delivery = date.today() - timedelta(days=30)
@@ -405,20 +398,17 @@ with tab1:
     fixed = {}
     errors = []
 
-    # ─── MODE A: Table (Excel paste) ──────────
     if input_mode == "📋 Table (paste from Excel)":
         st.markdown(
             "💡 **Tip:** Copy rows from Excel (Haul date | Type | Return date | Bin), "
             "click the first cell below, and press **Ctrl+V**. "
-            "Add rows with the **➕** below the table, or delete with the trash icon."
+            "Add rows with **➕** below the table, or delete with the trash icon."
         )
-
         st.caption(
             "Excel column format — Haul date: `YYYY-MM-DD` | Type: `S/Rtn` or `S/Repo` | "
-            "Return date: blank for S/Repo, defaults to haul date for S/Rtn (override for off-site gaps) "
+            "Return date: blank for S/Repo; defaults to haul date for S/Rtn (override for off-site gaps) "
             "| Bin: `Unknown` or `Bin 1`, `Bin 2`, etc."
         )
-
 
         earliest_delivery = min(delivery_dates.values())
         default_df = pd.DataFrame({
@@ -447,7 +437,7 @@ with tab1:
                 ),
                 "Return date": st.column_config.DateColumn(
                     "Return date",
-                    help="Date bin was returned. Same as haul for same-day. Ignored for S/Repo.",
+                    help="Blank for S/Repo. For S/Rtn, defaults to haul date when blank.",
                     format="YYYY-MM-DD",
                 ),
                 "Bin (if known)": st.column_config.SelectboxColumn(
@@ -460,7 +450,7 @@ with tab1:
             key="events_table",
         )
 
-if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
+        if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
             for i, row in edited_df.iterrows():
                 haul = row["Haul date"]
                 ev_type = row["Type"]
@@ -473,10 +463,8 @@ if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
                     haul = haul.date()
 
                 if ev_type == "S/Repo":
-                    # S/Repo ends rental — return date is ignored, treat as haul date internally
                     return_date = haul
                 else:
-                    # S/Rtn: blank return date defaults to haul date (same-day swap)
                     if pd.isna(return_date):
                         return_date = haul
                     elif hasattr(return_date, "date"):
@@ -512,7 +500,6 @@ if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
                     show_tree, fixed, free_days, rate
                 )
 
-    # ─── MODE B: Individual pickers ───────────
     else:
         n_events = st.number_input(
             "Number of events",
@@ -522,7 +509,7 @@ if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
             help="Use the +/- buttons to add or remove events.",
         )
 
-for i in range(int(n_events)):
+        for i in range(int(n_events)):
             st.markdown(f"**Event {i+1}**")
             c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1.5])
 
@@ -542,33 +529,30 @@ for i in range(int(n_events)):
 
             with c3:
                 if ev_type == "S/Rtn":
-                    # Auto-sync return date with haul date unless user has manually changed it
                     ret_key = f"ret{i}"
-                    ret_override_key = f"ret_overridden{i}"
+                    override_key = f"ret_overridden{i}"
 
-                    # Initialize override flag
-                    if ret_override_key not in st.session_state:
-                        st.session_state[ret_override_key] = False
+                    # Initialize override flag once per session
+                    has_override = st.session_state.get(override_key, False)
+                    if override_key not in st.session_state:
+                        st.session_state[override_key] = False
 
-                    # If user hasn't overridden, keep return date == haul date
-                    if not st.session_state[ret_override_key]:
+                    # Auto-sync return date with haul date unless user overrode it
+                    if not has_override:
                         st.session_state[ret_key] = haul
 
-                    prev_ret = st.session_state.get(ret_key, haul)
                     return_date = st.date_input(
                         "Return date",
                         key=ret_key,
                         help="Auto-fills to haul date. Edit only for off-site gaps.",
                     )
 
-                    # If user changed it to something different from haul, mark as overridden
+                    # Detect manual override
                     if return_date != haul:
-                        st.session_state[ret_override_key] = True
-                    elif return_date == haul and st.session_state[ret_override_key]:
-                        # User reverted to haul date — clear override
-                        st.session_state[ret_override_key] = False
+                        st.session_state[override_key] = True
+                    elif return_date == haul and has_override:
+                        st.session_state[override_key] = False
                 else:
-                    # S/Repo: rental ends, return date not applicable
                     return_date = haul
                     st.markdown("_(rental ends — no return date)_")
 
@@ -605,7 +589,7 @@ for i in range(int(n_events)):
                     show_tree, fixed, free_days, rate
                 )
 
-# ─── Tab 2: History ───────────────────────────
+
 with tab2:
     st.header("📚 Customer history")
     history = load_history()
@@ -616,9 +600,10 @@ with tab2:
         customers = sorted(set(h["customer"] for h in history))
         selected_customer = st.selectbox("Choose a customer", ["(all customers)"] + customers)
 
-        filtered = history if selected_customer == "(all customers)" else [
-            h for h in history if h["customer"] == selected_customer
-        ]
+        if selected_customer == "(all customers)":
+            filtered = history
+        else:
+            filtered = [h for h in history if h["customer"] == selected_customer]
 
         st.write(f"Showing **{len(filtered)}** record(s)")
 
@@ -627,7 +612,6 @@ with tab2:
             event_dates = [e["haul_date"] for e in h["events"]]
             date_range = f"{min(event_dates)} → {max(event_dates)}" if event_dates else "—"
 
-            # Handle both old (single delivery_date) and new (delivery_dates dict)
             if "delivery_dates" in h:
                 deliveries = sorted(set(h["delivery_dates"].values()))
                 if len(deliveries) == 1:
