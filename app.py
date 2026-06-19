@@ -412,10 +412,13 @@ with tab1:
             "click the first cell below, and press **Ctrl+V**. "
             "Add rows with the **➕** below the table, or delete with the trash icon."
         )
+
         st.caption(
             "Excel column format — Haul date: `YYYY-MM-DD` | Type: `S/Rtn` or `S/Repo` | "
-            "Return date: `YYYY-MM-DD` (blank = same as haul) | Bin: `Unknown` or `Bin 1`, `Bin 2`, etc."
+            "Return date: blank for S/Repo, defaults to haul date for S/Rtn (override for off-site gaps) "
+            "| Bin: `Unknown` or `Bin 1`, `Bin 2`, etc."
         )
+
 
         earliest_delivery = min(delivery_dates.values())
         default_df = pd.DataFrame({
@@ -457,7 +460,7 @@ with tab1:
             key="events_table",
         )
 
-        if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
+if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
             for i, row in edited_df.iterrows():
                 haul = row["Haul date"]
                 ev_type = row["Type"]
@@ -470,14 +473,18 @@ with tab1:
                     haul = haul.date()
 
                 if ev_type == "S/Repo":
+                    # S/Repo ends rental — return date is ignored, treat as haul date internally
                     return_date = haul
                 else:
+                    # S/Rtn: blank return date defaults to haul date (same-day swap)
                     if pd.isna(return_date):
                         return_date = haul
                     elif hasattr(return_date, "date"):
                         return_date = return_date.date()
                     if return_date < haul:
-                        errors.append(f"Row {i+1}: Return date is before haul date.")
+                        errors.append(
+                            f"Row {i+1}: Return date ({return_date}) is before haul date ({haul})."
+                        )
                         continue
 
                 event = {
@@ -515,32 +522,63 @@ with tab1:
             help="Use the +/- buttons to add or remove events.",
         )
 
-        for i in range(int(n_events)):
+for i in range(int(n_events)):
             st.markdown(f"**Event {i+1}**")
             c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1.5])
+
             with c1:
                 haul = st.date_input(
                     "Haul date",
                     key=f"haul{i}",
                     value=min(delivery_dates.values()) + timedelta(days=10 * (i + 1)),
                 )
+
             with c2:
                 ev_type = st.selectbox(
                     "Type",
                     type_options,
                     key=f"type{i}",
                 )
+
             with c3:
                 if ev_type == "S/Rtn":
-                    return_date = st.date_input("Return date", key=f"ret{i}", value=haul)
+                    # Auto-sync return date with haul date unless user has manually changed it
+                    ret_key = f"ret{i}"
+                    ret_override_key = f"ret_overridden{i}"
+
+                    # Initialize override flag
+                    if ret_override_key not in st.session_state:
+                        st.session_state[ret_override_key] = False
+
+                    # If user hasn't overridden, keep return date == haul date
+                    if not st.session_state[ret_override_key]:
+                        st.session_state[ret_key] = haul
+
+                    prev_ret = st.session_state.get(ret_key, haul)
+                    return_date = st.date_input(
+                        "Return date",
+                        key=ret_key,
+                        help="Auto-fills to haul date. Edit only for off-site gaps.",
+                    )
+
+                    # If user changed it to something different from haul, mark as overridden
+                    if return_date != haul:
+                        st.session_state[ret_override_key] = True
+                    elif return_date == haul and st.session_state[ret_override_key]:
+                        # User reverted to haul date — clear override
+                        st.session_state[ret_override_key] = False
                 else:
+                    # S/Repo: rental ends, return date not applicable
                     return_date = haul
-                    st.markdown("_(rental ends)_")
+                    st.markdown("_(rental ends — no return date)_")
+
             with c4:
                 bin_choice = st.selectbox("Bin (if known)", bin_options, key=f"bin{i}")
 
             if return_date < haul:
-                errors.append(f"Event {i+1}: Return date is before haul date.")
+                errors.append(
+                    f"Event {i+1}: Return date ({return_date}) is before haul date ({haul})."
+                )
 
             events.append({
                 "label": haul.strftime("%b %d"),
