@@ -130,6 +130,7 @@ def add_to_history(customer, delivery_date, events, results):
 # ──────────────────────────────────────────────
 # Render results (shared by both input modes)
 # ──────────────────────────────────────────────
+
 def render_results(results, events, num_bins, customer, delivery):
     if not results:
         st.error(
@@ -140,10 +141,14 @@ def render_results(results, events, num_bins, customer, delivery):
 
     st.success(f"Found {len(results)} valid scenario(s) across {len(events)} event(s).")
 
+    lowest = results[0]["total"]
+    highest = results[-1]["total"]
+    spread = highest - lowest
+
     m1, m2, m3 = st.columns(3)
-    m1.metric("Lowest total fee", f"${results[0]['total']:,.0f}")
-    m2.metric("Highest total fee", f"${results[-1]['total']:,.0f}")
-    m3.metric("Range", f"${results[-1]['total'] - results[0]['total']:,.0f}")
+    m1.metric("Lowest total fee", f"${lowest:,.0f}")
+    m2.metric("Highest total fee", f"${highest:,.0f}")
+    m3.metric("Range", f"${spread:,.0f}")
 
     table_rows = []
     for i, r in enumerate(results, 1):
@@ -151,7 +156,8 @@ def render_results(results, events, num_bins, customer, delivery):
         for b in range(1, int(num_bins) + 1):
             row[f"Bin {b}"] = ", ".join(r["assignment"][b]) or "(none)"
         for b in range(1, int(num_bins) + 1):
-            row[f"Bin {b} Fee"] = f"${r['fees'],.0f}"
+            bin_fee = r["fees"][b]
+            row[f"Bin {b} Fee"] = f"${bin_fee:,.0f}"
         row["Total"] = f"${r['total']:,.0f}"
         table_rows.append(row)
     st.dataframe(table_rows, use_container_width=True)
@@ -163,9 +169,13 @@ def render_results(results, events, num_bins, customer, delivery):
     )
     r = results[choice - 1]
     for b in range(1, int(num_bins) + 1):
-        with st.expander(f"Bin {b} — ${r['fees'],.0f}"):
-            if not r["breakdowns"]st.write("_No events on this bin._")
-            for c in r["breakdowns"]st.write(
+        bin_fee = r["fees"][b]
+        bin_breakdown = r["breakdowns"][b]
+        with st.expander(f"Bin {b} — ${bin_fee:,.0f}"):
+            if not bin_breakdown:
+                st.write("_No events on this bin._")
+            for c in bin_breakdown:
+                st.write(
                     f"• {c['cycle_start']} → {c['haul_date']}: "
                     f"{c['cycle_days']} days, {c['ext_days']} over → "
                     f"**${c['fee']:,.0f}**"
@@ -176,6 +186,7 @@ def render_results(results, events, num_bins, customer, delivery):
         st.info(f"✅ Saved to history under: **{customer.strip()}**")
     else:
         st.caption("ℹ️ Customer name was blank — not saved to history.")
+
 
 
 # ──────────────────────────────────────────────
