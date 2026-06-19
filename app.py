@@ -18,36 +18,55 @@ TYPE_DISPLAY = {
 }
 
 # ──────────────────────────────────────────────
-# Core calculation logic
+# Core fee calculation helper
 # ──────────────────────────────────────────────
-def calculate_allocations(delivery_date, free_days, rate_per_day, events,
+def fee_for_bin(bin_events, bin_delivery_date, free_days, rate_per_day):
+    if not bin_events:
+        return 0, []
+    fee = 0
+    breakdown = []
+    cycle_start = bin_delivery_date
+    for ev in bin_events:
+        cycle_days = (ev["haul_date"] - cycle_start).days + 1
+        ext_days = max(0, cycle_days - free_days)
+        cycle_fee = ext_days * rate_per_day
+        fee += cycle_fee
+        breakdown.append({
+            "cycle_start": cycle_start,
+            "haul_date": ev["haul_date"],
+            "cycle_days": cycle_days,
+            "ext_days": ext_days,
+            "fee": cycle_fee,
+        })
+        if ev["type"] == REPO:
+            break
+        cycle_start = ev["return_date"]
+    return fee, breakdown
+
+
+def is_valid_assignment(events, assignment, delivery_dates):
+    """Check that bins have at most 1 repo (last), and no event predates its bin's delivery."""
+    bins = {}
+    for i, ev in enumerate(events):
+        b = assignment[i]
+        bins.setdefault(b, []).append(ev)
+    for b, bin_events in bins.items():
+        bin_events.sort(key=lambda e: e["haul_date"])
+        repo_idx = [i for i, e in enumerate(bin_events) if e["type"] == REPO]
+        if len(repo_idx) > 1:
+            return False
+        if repo_idx and repo_idx[0] != len(bin_events) - 1:
+            return False
+        for e in bin_events:
+            if e["haul_date"] < delivery_datesreturn False
+    return True
+
+
+def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
                           fixed_assignments=None, num_bins=2):
     fixed_assignments = fixed_assignments or {}
     n = len(events)
     free_indices = [i for i in range(n) if i not in fixed_assignments]
-
-    def fee_for_bin(bin_events):
-        if not bin_events:
-            return 0, []
-        fee = 0
-        breakdown = []
-        cycle_start = delivery_date
-        for ev in bin_events:
-            cycle_days = (ev["haul_date"] - cycle_start).days + 1
-            ext_days = max(0, cycle_days - free_days)
-            cycle_fee = ext_days * rate_per_day
-            fee += cycle_fee
-            breakdown.append({
-                "cycle_start": cycle_start,
-                "haul_date": ev["haul_date"],
-                "cycle_days": cycle_days,
-                "ext_days": ext_days,
-                "fee": cycle_fee,
-            })
-            if ev["type"] == REPO:
-                break
-            cycle_start = ev["return_date"]
-        return fee, breakdown
 
     results = []
     for combo in product(range(1, num_bins + 1), repeat=len(free_indices)):
@@ -55,31 +74,25 @@ def calculate_allocations(delivery_date, free_days, rate_per_day, events,
         for idx, bin_num in zip(free_indices, combo):
             assignment[idx] = bin_num
 
+        if not is_valid_assignment(events, assignment, delivery_dates):
+            continue
+
         bins = {b: [] for b in range(1, num_bins + 1)}
         for i, ev in enumerate(events):
             bins[assignment[i]].append(ev)
         for b in bins:
             bins[b].sort(key=lambda e: e["haul_date"])
 
-        valid = True
-        for b in bins:
-            repo_indices = [i for i, e in enumerate(bins[b]) if e["type"] == REPO]
-            if len(repo_indices) > 1:
-                valid = False
-                break
-            if repo_indices and repo_indices[0] != len(bins[b]) - 1:
-                valid = False
-                break
-        if not valid:
-            continue
-
         fees = {}
         breakdowns = {}
         for b in bins:
-            fees[b], breakdowns[b] = fee_for_bin(bins[b])
+            fees[b], breakdowns[b] = fee_for_bin(
+                bins[b], delivery_dates[b], free_days, rate_per_day
+            )
         total = sum(fees.values())
 
         results.append({
+            "combo": combo,
             "assignment": {b: [e["label"] for e in bins[b]] for b in bins},
             "fees": fees,
             "breakdowns": breakdowns,
@@ -88,6 +101,92 @@ def calculate_allocations(delivery_date, free_days, rate_per_day, events,
 
     results.sort(key=lambda r: r["total"])
     return results
+
+
+# ──────────────────────────────────────────────
+# Decision tree (Graphviz DOT) builder
+# ──────────────────────────────────────────────
+def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
+                            free_days, rate_per_day):
+    free_indices = [i for i in range(len(events)) if i not in fixed_assignments]
+
+    if not free_indices:
+        return None
+
+    lines = []
+    lines.append("digraph DT {")
+    lines.append('  rankdir=TB;')
+    lines.append('  node [shape=box, style="rounded,filled", fillcolor=white, fontname="Arial"];')
+    lines.append('  edge [fontname="Arial", fontsize=10];')
+
+    # Root node
+    fixed_summary_parts = []
+    for idx, b in fixed_assignments.items():
+        lbl = events[idx]["label"]
+        fixed_summary_parts.append(f"{lbl}={chr(0x2192)}B{b}")
+    fixed_summary = ", ".join(fixed_summary_parts) if fixed_summary_parts else "no fixed events"
+    root_label = "Start\\n(" + fixed_summary + ")"
+    lines.append(f'  root [label="{root_label}", shape=ellipse, fillcolor="#cfe2ff"];')
+
+    # BFS: build all paths
+    node_counter = [0]
+    def new_id():
+        node_counter[0] += 1
+        return f"n{node_counter[0]}"
+
+    # Map partial path tuple -> node id
+    frontier = {(): "root"}
+
+    for depth, idx in enumerate(free_indices):
+        ev_label = events[idx]["label"]
+        is_last = (depth == len(free_indices) - 1)
+        next_frontier = {}
+        for partial, parent_id in frontier.items():
+            for bin_num in range(1, num_bins + 1):
+                new_partial = partial + (bin_num,)
+                nid = new_id()
+
+                if is_last:
+                    # Leaf - compute total fee
+                    full_assignment = dict(fixed_assignments)
+                    for fi, bn in zip(free_indices, new_partial):
+                        full_assignment[fi] = bn
+
+                    if is_valid_assignment(events, full_assignment, delivery_dates):
+                        bins_map = {b: [] for b in range(1, num_bins + 1)}
+                        for i, ev in enumerate(events):
+                            bins_map[full_assignment[i]].append(ev)
+                        for b in bins_map:
+                            bins_map[b].sort(key=lambda e: e["haul_date"])
+                        total = 0
+                        for b in bins_map:
+                            f, _ = fee_for_bin(bins_map[b], delivery_dates[b], free_days, rate_per_day)
+                            total += f
+                        formatted_total = f"${total:,.0f}"
+                        leaf_label = "Total: " + formatted_total
+                        lines.append(f'  {nid} [label="{leaf_label}", fillcolor="#d1e7dd"];')
+                    else:
+                        lines.append(f'  {nid} [label="(invalid)", fillcolor="#f8d7da"];')
+                else:
+                    next_idx = free_indices[depth + 1]
+                    next_lbl = events[next_idx]["label"]
+                    node_label = "Service " + next_lbl + "\\n\xe2\x86\x92 ?"
+                    # Use ASCII fallback for arrow inside DOT
+                    node_label = "Service " + next_lbl + " -> ?"
+                    lines.append(f'  {nid} [label="{node_label}"];')
+
+                edge_label = f"Bin {bin_num}"
+                lines.append(f'  {parent_id} -> {nid} [label="  {edge_label}  "];')
+                next_frontier[new_partial] = nid
+
+        frontier = next_frontier
+
+    # Add a header note above root
+    lines.append('  info [label="Each branch = which bin handled that service", shape=note, fillcolor="#fff3cd"];')
+    lines.append('  info -> root [style=invis];')
+
+    lines.append("}")
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────
@@ -102,15 +201,17 @@ def load_history():
     except Exception:
         return []
 
+
 def save_history(entries):
     with open(HISTORY_FILE, "w") as f:
         json.dump(entries, f, indent=2, default=str)
 
-def add_to_history(customer, delivery_date, events, results):
+
+def add_to_history(customer, delivery_dates, events, results):
     history = load_history()
     history.append({
         "customer": customer,
-        "delivery_date": str(delivery_date),
+        "delivery_dates": {str(b): str(d) for b, d in delivery_dates.items()},
         "events": [
             {
                 "label": e["label"],
@@ -128,14 +229,15 @@ def add_to_history(customer, delivery_date, events, results):
 
 
 # ──────────────────────────────────────────────
-# Render results (shared by both input modes)
+# Render results
 # ──────────────────────────────────────────────
-
-def render_results(results, events, num_bins, customer, delivery):
+def render_results(results, events, num_bins, customer, delivery_dates,
+                   show_tree, fixed_assignments, free_days, rate_per_day):
     if not results:
         st.error(
-            "No valid scenarios found. Check that each bin has at most "
-            "one S/Repo event and that it's the last event for that bin."
+            "No valid scenarios found. Check that each bin has at most one "
+            "S/Repo (and it's the last event for that bin), and that no event "
+            "predates its bin's delivery date."
         )
         return
 
@@ -150,11 +252,13 @@ def render_results(results, events, num_bins, customer, delivery):
     m2.metric("Highest total fee", f"${highest:,.0f}")
     m3.metric("Range", f"${spread:,.0f}")
 
+    # Scenario table
     table_rows = []
     for i, r in enumerate(results, 1):
         row = {"#": i}
         for b in range(1, int(num_bins) + 1):
-            row[f"Bin {b}"] = ", ".join(r["assignment"][b]) or "(none)"
+            services_list = r["assignment"][b]
+            row[f"Bin {b}"] = ", ".join(services_list) if services_list else "(none)"
         for b in range(1, int(num_bins) + 1):
             bin_fee = r["fees"][b]
             row[f"Bin {b} Fee"] = f"${bin_fee:,.0f}"
@@ -162,6 +266,26 @@ def render_results(results, events, num_bins, customer, delivery):
         table_rows.append(row)
     st.dataframe(table_rows, use_container_width=True)
 
+    # Optional decision tree
+    if show_tree:
+        st.subheader("🌳 Decision tree")
+        st.caption(
+            "Each path from Start to a leaf represents one scenario. "
+            "Edge labels show which bin handled that service. "
+            "Use mouse wheel to zoom; click + drag to pan."
+        )
+        dot = build_decision_tree_dot(
+            events, fixed_assignments, num_bins, delivery_dates, free_days, rate_per_day
+        )
+        if dot is None:
+            st.info("No decisions to display — all events are locked to specific bins.")
+        else:
+            try:
+                st.graphviz_chart(dot, use_container_width=True)
+            except Exception as ex:
+                st.warning(f"Could not render decision tree: {ex}")
+
+    # Drill-down
     st.subheader("📋 Scenario breakdown")
     choice = st.selectbox(
         "View detailed cycle math for scenario:",
@@ -171,22 +295,24 @@ def render_results(results, events, num_bins, customer, delivery):
     for b in range(1, int(num_bins) + 1):
         bin_fee = r["fees"][b]
         bin_breakdown = r["breakdowns"][b]
-        with st.expander(f"Bin {b} — ${bin_fee:,.0f}"):
+        header = f"Bin {b} — ${bin_fee:,.0f}"
+        with st.expander(header):
             if not bin_breakdown:
                 st.write("_No events on this bin._")
             for c in bin_breakdown:
-                st.write(
+                line = (
                     f"• {c['cycle_start']} → {c['haul_date']}: "
                     f"{c['cycle_days']} days, {c['ext_days']} over → "
                     f"**${c['fee']:,.0f}**"
                 )
+                st.write(line)
 
+    # Save to history
     if customer.strip():
-        add_to_history(customer.strip(), delivery, events, results)
+        add_to_history(customer.strip(), delivery_dates, events, results)
         st.info(f"✅ Saved to history under: **{customer.strip()}**")
     else:
         st.caption("ℹ️ Customer name was blank — not saved to history.")
-
 
 
 # ──────────────────────────────────────────────
@@ -225,13 +351,41 @@ with st.sidebar:
     num_bins = st.number_input("Number of bins on site", value=2, min_value=1, max_value=5)
     st.caption("Off-site days (between haul and return) are not billed.")
 
+    st.divider()
+    show_tree = st.checkbox(
+        "🌳 Show decision tree",
+        value=False,
+        help="Renders a Graphviz tree of all allocation possibilities. Can get wide for many unknowns — zoom/pan as needed.",
+    )
+
 # ─── Tab 1: Calculator ────────────────────────
 with tab1:
     col_a, col_b = st.columns([1, 1])
     with col_a:
         customer = st.text_input("Customer name (leave blank to skip saving to history)", "")
     with col_b:
-        delivery = st.date_input("Delivery date", value=date.today() - timedelta(days=30))
+        staggered_delivery = st.checkbox(
+            "Bins delivered on different dates?",
+            help="Check this if bins were dropped off on separate days (e.g., bin added mid-project).",
+        )
+
+    default_delivery = date.today() - timedelta(days=30)
+    delivery_dates = {}
+
+    if staggered_delivery:
+        st.markdown("**Per-bin delivery dates:**")
+        cols = st.columns(int(num_bins))
+        for b in range(1, int(num_bins) + 1):
+            with cols[b - 1]:
+                delivery_dates[b] = st.date_input(
+                    f"Bin {b} delivery",
+                    value=default_delivery,
+                    key=f"delivery_bin_{b}",
+                )
+    else:
+        single_delivery = st.date_input("Delivery date (all bins)", value=default_delivery)
+        for b in range(1, int(num_bins) + 1):
+            delivery_dates[b] = single_delivery
 
     st.subheader("Events")
     st.caption("**S/Rtn** = Service & return (bin comes back) | **S/Repo** = Service & repo (rental ends)")
@@ -255,17 +409,18 @@ with tab1:
         st.markdown(
             "💡 **Tip:** Copy rows from Excel (Haul date | Type | Return date | Bin), "
             "click the first cell below, and press **Ctrl+V**. "
-            "Add rows with the **➕** button below the table, or delete with the trash icon."
+            "Add rows with the **➕** below the table, or delete with the trash icon."
         )
         st.caption(
             "Excel column format — Haul date: `YYYY-MM-DD` | Type: `S/Rtn` or `S/Repo` | "
             "Return date: `YYYY-MM-DD` (blank = same as haul) | Bin: `Unknown` or `Bin 1`, `Bin 2`, etc."
         )
 
+        earliest_delivery = min(delivery_dates.values())
         default_df = pd.DataFrame({
-            "Haul date": [delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
+            "Haul date": [earliest_delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
             "Type": ["S/Rtn"] * 3,
-            "Return date": [delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
+            "Return date": [earliest_delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
             "Bin (if known)": ["Unknown"] * 3,
         })
 
@@ -342,9 +497,12 @@ with tab1:
                 st.warning("Please add at least one event before calculating.")
             else:
                 results = calculate_allocations(
-                    delivery, free_days, rate, events, fixed, int(num_bins)
+                    delivery_dates, free_days, rate, events, fixed, int(num_bins)
                 )
-                render_results(results, events, num_bins, customer, delivery)
+                render_results(
+                    results, events, num_bins, customer, delivery_dates,
+                    show_tree, fixed, free_days, rate
+                )
 
     # ─── MODE B: Individual pickers ───────────
     else:
@@ -363,7 +521,7 @@ with tab1:
                 haul = st.date_input(
                     "Haul date",
                     key=f"haul{i}",
-                    value=delivery + timedelta(days=10 * (i + 1)),
+                    value=min(delivery_dates.values()) + timedelta(days=10 * (i + 1)),
                 )
             with c2:
                 ev_type = st.selectbox(
@@ -401,9 +559,12 @@ with tab1:
                 st.warning("Please add at least one event before calculating.")
             else:
                 results = calculate_allocations(
-                    delivery, free_days, rate, events, fixed, int(num_bins)
+                    delivery_dates, free_days, rate, events, fixed, int(num_bins)
                 )
-                render_results(results, events, num_bins, customer, delivery)
+                render_results(
+                    results, events, num_bins, customer, delivery_dates,
+                    show_tree, fixed, free_days, rate
+                )
 
 # ─── Tab 2: History ───────────────────────────
 with tab2:
@@ -426,9 +587,20 @@ with tab2:
         for h in filtered:
             event_dates = [e["haul_date"] for e in h["events"]]
             date_range = f"{min(event_dates)} → {max(event_dates)}" if event_dates else "—"
+
+            # Handle both old (single delivery_date) and new (delivery_dates dict)
+            if "delivery_dates" in h:
+                deliveries = sorted(set(h["delivery_dates"].values()))
+                if len(deliveries) == 1:
+                    delivery_display = deliveries[0]
+                else:
+                    delivery_display = f"{deliveries[0]} → {deliveries[-1]}"
+            else:
+                delivery_display = h.get("delivery_date", "—")
+
             rows.append({
                 "Customer": h["customer"],
-                "Delivery": h["delivery_date"],
+                "Delivery": delivery_display,
                 "Event date range": date_range,
                 "# Events": len(h["events"]),
                 "Scenarios": h["scenario_count"],
