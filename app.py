@@ -417,20 +417,92 @@ with tab1:
                 "Bin (if known)": ["Unknown"] * 3,
             })
 
-        # Apply auto-sync rules before showing:
-        # - S/Repo -> clear return date (blank)
-        # - S/Rtn with blank return date -> fill with haul date
+        # Track which return dates have been manually overridden per row.
+        # When a return date matches its haul date, we consider it "auto-synced"
+        # and update it when haul changes. When they differ, the user has
+        # overridden it — we leave it alone.
+        if "prev_table_state" not in st.session_state:
+            st.session_state["prev_table_state"] = {}
+
         df_to_show = st.session_state["events_table_df"].copy()
+        prev_state = st.session_state["prev_table_state"]
+
         for idx in df_to_show.index:
             row_type = df_to_show.at[idx, "Type"]
             row_haul = df_to_show.at[idx, "Haul date"]
             row_return = df_to_show.at[idx, "Return date"]
 
+            prev = prev_state.get(idx, {})
+            prev_haul = prev.get("haul")
+            prev_return = prev.get("return")
+            was_synced = prev.get("synced", True)
+
             if row_type == "S/Repo":
+                # S/Repo: rental ends. Clear return date.
                 df_to_show.at[idx, "Return date"] = pd.NaT
+                prev_state[idx] = {"haul": row_haul, "return": pd.NaT, "synced": True}
+
             elif row_type == "S/Rtn":
                 if pd.isna(row_return) and not pd.isna(row_haul):
+                    # Blank return -> auto-fill with haul date
                     df_to_show.at[idx, "Return date"] = row_haul
+                    prev_state[idx] = {"haul": row_haul, "return": row_haul, "synced": True}
+
+                elif not pd.isna(row_haul) and not pd.isna(row_return):
+                    # Check if user changed haul date while return was previously synced
+                    haul_changed = (prev_haul is not None and row_haul != prev_haul)
+                    return_changed_by_user = (
+                        prev_return is not None and row_return != prev_return
+                    )
+
+                    if return_changed_by_user and row_return != row_haul:
+                        # User manually changed return date to something other than haul
+                        prev_state[idx] = {
+                            "haul": row_haul,
+                            "return": row_return,
+                            "synced": False,
+                        }
+                    elif haul_changed and was_synced:
+                        # Haul changed and return was previously following it — keep them in sync
+                        df_to_show.at[idx, "Return date"] = row_haul
+                        prev_state[idx] = {
+                            "haul": row_haul,
+                            "return": row_haul,
+                            "synced": True,
+                        }
+                    elif row_return == row_haul:
+                        # Dates match — treat as synced again
+                        prev_state[idx] = {
+                            "haul": row_haul,
+                            "return": row_haul,
+                            "synced": True,
+                        }
+                    else:
+                        # Stay as-is (override preserved)
+                        prev_state[idx] = {
+                            "haul": row_haul,
+                            "return": row_return,
+                            "synced": was_synced,
+                        }
+                else:
+                    # Edge case — leave row alone
+                    prev_state[idx] = {"haul": row_haul, "return": row_return, "synced": was_synced}
+
+        st.session_state["prev_table_state"] = prev_state
+
+        # Build an error column to visually flag rows where return < haul
+        df_to_show["⚠️"] = ""
+        for idx in df_to_show.index:
+            row_type = df_to_show.at[idx, "Type"]
+            row_haul = df_to_show.at[idx, "Haul date"]
+            row_return = df_to_show.at[idx, "Return date"]
+            if (
+                row_type == "S/Rtn"
+                and not pd.isna(row_haul)
+                and not pd.isna(row_return)
+                and row_return < row_haul
+            ):
+                df_to_show.at[idx, "⚠️"] = "⚠️ Return before haul"
 
         edited_df = st.data_editor(
             df_to_show,
@@ -451,7 +523,7 @@ with tab1:
                 ),
                 "Return date": st.column_config.DateColumn(
                     "Return date",
-                    help="Blank for S/Repo. For S/Rtn, defaults to haul date when blank.",
+                    help="Blank for S/Repo. For S/Rtn, follows haul date until manually overridden.",
                     format="YYYY-MM-DD",
                 ),
                 "Bin (if known)": st.column_config.SelectboxColumn(
@@ -460,12 +532,30 @@ with tab1:
                     options=bin_options,
                     required=True,
                 ),
+                "⚠️": st.column_config.TextColumn(
+                    "⚠️",
+                    help="Flags rows where return date is before haul date (impossible)",
+                    disabled=True,
+                    width="small",
+                ),
             },
             key="events_table",
         )
 
-        # Persist edits so the next rerun applies auto-sync to the new state
-        st.session_state["events_table_df"] = edited_df.copy()
+        # Persist edits so the next rerun applies auto-sync to the new state.
+        # Drop the warning column — it's recomputed each rerun, not user data.
+        df_to_save = edited_df.copy()
+        if "⚠️" in df_to_save.columns:
+            df_to_save = df_to_save.drop(columns=["⚠️"])
+        st.session_state["events_table_df"] = df_to_save
+
+        # Show a banner if any row has impossible dates
+        invalid_rows = edited_df[edited_df.get("⚠️", "") != ""]
+        if not invalid_rows.empty:
+            st.error(
+                f"⚠️ {len(invalid_rows)} row(s) have return date before haul date — "
+                "this is impossible. Fix before calculating."
+            )
 
         # Manual refresh button for users who want auto-sync without calculating
         col_refresh, _ = st.columns([1, 3])
