@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 import json
 import os
 from datetime import date, timedelta
@@ -10,6 +11,11 @@ from itertools import product
 SERVICE_RETURN = "service_return"
 REPO = "repo"
 HISTORY_FILE = "history.json"
+
+TYPE_DISPLAY = {
+    "Service & return": SERVICE_RETURN,
+    "Final repo": REPO,
+}
 
 # ──────────────────────────────────────────────
 # Core calculation logic
@@ -85,7 +91,7 @@ def calculate_allocations(delivery_date, free_days, rate_per_day, events,
 
 
 # ──────────────────────────────────────────────
-# History storage (JSON file)
+# History storage
 # ──────────────────────────────────────────────
 def load_history():
     if not os.path.exists(HISTORY_FILE):
@@ -122,6 +128,57 @@ def add_to_history(customer, delivery_date, events, results):
 
 
 # ──────────────────────────────────────────────
+# Render results (shared by both input modes)
+# ──────────────────────────────────────────────
+def render_results(results, events, num_bins, customer, delivery):
+    if not results:
+        st.error(
+            "No valid scenarios found. Check that each bin has at most "
+            "one Final repo event and that it's the last event for that bin."
+        )
+        return
+
+    st.success(f"Found {len(results)} valid scenario(s) across {len(events)} event(s).")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Lowest total fee", f"${results[0]['total']:,.0f}")
+    m2.metric("Highest total fee", f"${results[-1]['total']:,.0f}")
+    m3.metric("Range", f"${results[-1]['total'] - results[0]['total']:,.0f}")
+
+    table_rows = []
+    for i, r in enumerate(results, 1):
+        row = {"#": i}
+        for b in range(1, int(num_bins) + 1):
+            row[f"Bin {b}"] = ", ".join(r["assignment"][b]) or "(none)"
+        for b in range(1, int(num_bins) + 1):
+            row[f"Bin {b} Fee"] = f"${r['fees'],.0f}"
+        row["Total"] = f"${r['total']:,.0f}"
+        table_rows.append(row)
+    st.dataframe(table_rows, use_container_width=True)
+
+    st.subheader("📋 Scenario breakdown")
+    choice = st.selectbox(
+        "View detailed cycle math for scenario:",
+        list(range(1, len(results) + 1)),
+    )
+    r = results[choice - 1]
+    for b in range(1, int(num_bins) + 1):
+        with st.expander(f"Bin {b} — ${r['fees'],.0f}"):
+            if not r["breakdowns"]st.write("_No events on this bin._")
+            for c in r["breakdowns"]st.write(
+                    f"• {c['cycle_start']} → {c['haul_date']}: "
+                    f"{c['cycle_days']} days, {c['ext_days']} over → "
+                    f"**${c['fee']:,.0f}**"
+                )
+
+    if customer.strip():
+        add_to_history(customer.strip(), delivery, events, results)
+        st.info(f"✅ Saved to history under: **{customer.strip()}**")
+    else:
+        st.caption("ℹ️ Customer name was blank — not saved to history.")
+
+
+# ──────────────────────────────────────────────
 # Streamlit UI
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="Roll-Off Bin Fee Calculator", layout="wide")
@@ -129,7 +186,6 @@ st.title("🚛 Roll-Off Bin Extension Fee Calculator")
 
 tab1, tab2 = st.tabs(["🧮 Calculator", "📚 History"])
 
-# ─── Sidebar (shared) ─────────────────────────
 with st.sidebar:
     st.header("Rental Terms")
     free_days = st.number_input("Free rental days per cycle", value=10, min_value=1)
@@ -142,100 +198,179 @@ with tab1:
     col_a, col_b = st.columns([1, 1])
     with col_a:
         customer = st.text_input("Customer name (leave blank to skip saving to history)", "")
-        delivery = st.date_input("Delivery date", value=date.today() - timedelta(days=30))
     with col_b:
-        n_events = st.number_input("Number of events", value=5, min_value=1, max_value=12)
+        delivery = st.date_input("Delivery date", value=date.today() - timedelta(days=30))
 
     st.subheader("Events")
-    st.caption("Mark each event as service-and-return (with optional off-site gap) or final repo.")
+
+    input_mode = st.radio(
+        "Input mode",
+        ["📋 Table (paste from Excel)", "🎯 Individual pickers"],
+        horizontal=True,
+        help="Table mode supports pasting rows from Excel. Picker mode shows one form per event.",
+    )
+
+    bin_options = ["Unknown"] + [f"Bin {b+1}" for b in range(int(num_bins))]
+    type_options = list(TYPE_DISPLAY.keys())
 
     events = []
     fixed = {}
-    bin_options = ["Unknown"] + [f"Bin {b+1}" for b in range(int(num_bins))]
+    errors = []
 
-    for i in range(int(n_events)):
-        st.markdown(f"**Event {i+1}**")
-        c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1.5])
-        with c1:
-            haul = st.date_input(
-                "Haul date",
-                key=f"haul{i}",
-                value=delivery + timedelta(days=10 * (i + 1)),
-            )
-        with c2:
-            ev_type = st.selectbox(
-                "Type",
-                ["Service & return", "Final repo"],
-                key=f"type{i}",
-            )
-        with c3:
-            if ev_type == "Service & return":
-                return_date = st.date_input("Return date", key=f"ret{i}", value=haul)
-            else:
-                return_date = haul
-                st.markdown("_(rental ends)_")
-        with c4:
-            bin_choice = st.selectbox("Bin (if known)", bin_options, key=f"bin{i}")
-
-        events.append({
-            "label": haul.strftime("%b %d"),
-            "haul_date": haul,
-            "return_date": return_date,
-            "type": REPO if ev_type == "Final repo" else SERVICE_RETURN,
-        })
-        if bin_choice != "Unknown":
-            fixed[i] = int(bin_choice.split()[-1])
-        st.divider()
-
-    if st.button("🧮 Calculate all scenarios", type="primary"):
-        results = calculate_allocations(
-            delivery, free_days, rate, events, fixed, int(num_bins)
+    # ─── MODE A: Table (Excel paste) ──────────
+    if input_mode == "📋 Table (paste from Excel)":
+        st.markdown(
+            "💡 **Tip:** Copy rows from Excel (Haul date | Type | Return date | Bin), "
+            "click the first cell below, and press **Ctrl+V**. "
+            "Add rows with the **➕** button below the table, or delete with the trash icon."
+        )
+        st.caption(
+            "Excel column format — Haul date: `YYYY-MM-DD` | Type: `Service & return` or `Final repo` | "
+            "Return date: `YYYY-MM-DD` (blank = same as haul) | Bin: `Unknown` or `Bin 1`, `Bin 2`, etc."
         )
 
-        if not results:
-            st.error("No valid scenarios. Check that each bin has at most one repo and that it's the last event for that bin.")
-        else:
-            st.success(f"Found {len(results)} valid scenario(s)")
+        default_df = pd.DataFrame({
+            "Haul date": [delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
+            "Type": ["Service & return"] * 3,
+            "Return date": [delivery + timedelta(days=10 * (i + 1)) for i in range(3)],
+            "Bin (if known)": ["Unknown"] * 3,
+        })
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Lowest total fee", f"${results[0]['total']:,.0f}")
-            m2.metric("Highest total fee", f"${results[-1]['total']:,.0f}")
-            m3.metric("Range", f"${results[-1]['total'] - results[0]['total']:,.0f}")
+        edited_df = st.data_editor(
+            default_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Haul date": st.column_config.DateColumn(
+                    "Haul date",
+                    help="Date the bin was picked up for service",
+                    format="YYYY-MM-DD",
+                    required=True,
+                ),
+                "Type": st.column_config.SelectboxColumn(
+                    "Type",
+                    help="Service & return = bin returns; Final repo = rental ends",
+                    options=type_options,
+                    required=True,
+                ),
+                "Return date": st.column_config.DateColumn(
+                    "Return date",
+                    help="Date bin was returned. Same as haul for same-day. Ignored for Final repo.",
+                    format="YYYY-MM-DD",
+                ),
+                "Bin (if known)": st.column_config.SelectboxColumn(
+                    "Bin (if known)",
+                    help="Lock event to a specific bin, or leave Unknown",
+                    options=bin_options,
+                    required=True,
+                ),
+            },
+            key="events_table",
+        )
 
-            table_rows = []
-            for i, r in enumerate(results, 1):
-                row = {"#": i}
-                for b in range(1, int(num_bins) + 1):
-                    row[f"Bin {b}"] = ", ".join(r["assignment"][b]) or "(none)"
-                for b in range(1, int(num_bins) + 1):
-                    row[f"Bin {b} Fee"] = f"${r['fees'][b]:,.0f}"
-                row["Total"] = f"${r['total']:,.0f}"
-                table_rows.append(row)
-            st.dataframe(table_rows, use_container_width=True)
+        if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
+            for i, row in edited_df.iterrows():
+                haul = row["Haul date"]
+                ev_type = row["Type"]
+                return_date = row["Return date"]
+                bin_choice = row["Bin (if known)"]
 
-            st.subheader("📋 Scenario breakdown")
-            choice = st.selectbox(
-                "View detailed cycle math for scenario:",
-                list(range(1, len(results) + 1)),
-            )
-            r = results[choice - 1]
-            for b in range(1, int(num_bins) + 1):
-                with st.expander(f"Bin {b} — ${r['fees'][b]:,.0f}"):
-                    if not r["breakdowns"][b]:
-                        st.write("_No events on this bin._")
-                    for c in r["breakdowns"][b]:
-                        st.write(
-                            f"• {c['cycle_start']} → {c['haul_date']}: "
-                            f"{c['cycle_days']} days, {c['ext_days']} over → "
-                            f"**${c['fee']:,.0f}**"
-                        )
+                if pd.isna(haul):
+                    continue
+                if hasattr(haul, "date"):
+                    haul = haul.date()
 
-            # Save to history only if customer name provided
-            if customer.strip():
-                add_to_history(customer.strip(), delivery, events, results)
-                st.info(f"✅ Saved to history under: **{customer.strip()}**")
+                if ev_type == "Final repo":
+                    return_date = haul
+                else:
+                    if pd.isna(return_date):
+                        return_date = haul
+                    elif hasattr(return_date, "date"):
+                        return_date = return_date.date()
+                    if return_date < haul:
+                        errors.append(f"Row {i+1}: Return date is before haul date.")
+                        continue
+
+                event = {
+                    "label": haul.strftime("%b %d"),
+                    "haul_date": haul,
+                    "return_date": return_date,
+                    "type": TYPE_DISPLAY.get(ev_type, SERVICE_RETURN),
+                }
+                events.append(event)
+
+                if bin_choice and bin_choice != "Unknown":
+                    fixed[len(events) - 1] = int(bin_choice.split()[-1])
+
+            if errors:
+                for err in errors:
+                    st.error(err)
+            elif not events:
+                st.warning("Please add at least one event before calculating.")
             else:
-                st.caption("ℹ️ Customer name was blank — not saved to history.")
+                results = calculate_allocations(
+                    delivery, free_days, rate, events, fixed, int(num_bins)
+                )
+                render_results(results, events, num_bins, customer, delivery)
+
+    # ─── MODE B: Individual pickers ───────────
+    else:
+        n_events = st.number_input(
+            "Number of events",
+            value=5,
+            min_value=1,
+            max_value=20,
+            help="Use the +/- buttons to add or remove events.",
+        )
+
+        for i in range(int(n_events)):
+            st.markdown(f"**Event {i+1}**")
+            c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1.5])
+            with c1:
+                haul = st.date_input(
+                    "Haul date",
+                    key=f"haul{i}",
+                    value=delivery + timedelta(days=10 * (i + 1)),
+                )
+            with c2:
+                ev_type = st.selectbox(
+                    "Type",
+                    type_options,
+                    key=f"type{i}",
+                )
+            with c3:
+                if ev_type == "Service & return":
+                    return_date = st.date_input("Return date", key=f"ret{i}", value=haul)
+                else:
+                    return_date = haul
+                    st.markdown("_(rental ends)_")
+            with c4:
+                bin_choice = st.selectbox("Bin (if known)", bin_options, key=f"bin{i}")
+
+            if return_date < haul:
+                errors.append(f"Event {i+1}: Return date is before haul date.")
+
+            events.append({
+                "label": haul.strftime("%b %d"),
+                "haul_date": haul,
+                "return_date": return_date,
+                "type": TYPE_DISPLAY.get(ev_type, SERVICE_RETURN),
+            })
+            if bin_choice != "Unknown":
+                fixed[i] = int(bin_choice.split()[-1])
+            st.divider()
+
+        if st.button("🧮 Calculate all scenarios", type="primary", key="calc_picker"):
+            if errors:
+                for err in errors:
+                    st.error(err)
+            elif not events:
+                st.warning("Please add at least one event before calculating.")
+            else:
+                results = calculate_allocations(
+                    delivery, free_days, rate, events, fixed, int(num_bins)
+                )
+                render_results(results, events, num_bins, customer, delivery)
 
 # ─── Tab 2: History ───────────────────────────
 with tab2:
@@ -254,7 +389,6 @@ with tab2:
 
         st.write(f"Showing **{len(filtered)}** record(s)")
 
-        # Build timeline table
         rows = []
         for h in filtered:
             event_dates = [e["haul_date"] for e in h["events"]]
@@ -271,18 +405,17 @@ with tab2:
             })
         st.dataframe(rows, use_container_width=True)
 
-        # Detail viewer
         st.subheader("🔍 View record details")
-        idx = st.number_input(
-            "Record # to view",
-            min_value=1,
-            max_value=len(filtered),
-            value=1,
-        )
-        rec = filtered[idx - 1]
-        st.json(rec)
+        if filtered:
+            idx = st.number_input(
+                "Record # to view",
+                min_value=1,
+                max_value=len(filtered),
+                value=1,
+            )
+            rec = filtered[idx - 1]
+            st.json(rec)
 
-        # Clear history button
         st.divider()
         with st.expander("⚠️ Danger zone"):
             if st.button("🗑️ Clear all history"):
