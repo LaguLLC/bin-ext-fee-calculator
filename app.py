@@ -440,11 +440,11 @@ def render_results(results, events, num_bins, customer, delivery_dates,
     if (not interchangeable) and has_unknown_bins:
         st.warning(
             "⚠️ You have rows with unknown bin assignments and "
-            "**Hide equivalent permutations** is off. You'll see all possible "
-            "permutations — including ones that are mirror images of each "
-            "other (same event groupings, just with bin labels swapped). "
-            "Consider turning on **Hide equivalent permutations** if you only "
-            "need distinct outcomes."
+            "**Hide equivalent permutations** is off. You'll see "
+            "all possible bin assignments — including ones with the "
+            "same figures and event groupings. Consider turning on "
+            "**Hide equivalent permutations** if you only need "
+            "distinct outcomes."
         )
 
     removed_count = 0
@@ -455,7 +455,7 @@ def render_results(results, events, num_bins, customer, delivery_dates,
     if removed_count > 0:
         msg += (
             f" Hid {removed_count} equivalent permutation(s) "
-            "(mirror assignments that produce identical math)."
+            "(same figures and event groupings — only bin labels differ)."
         )
     st.success(msg)
 
@@ -619,11 +619,10 @@ with st.sidebar:
         "🔁 Hide equivalent permutations",
         value=True,
         help=(
-            "Collapses scenarios that are mirror images of each other — same "
-            "event groupings, just with bin labels swapped, AND that produce "
-            "identical per-bin math. Two scenarios with the same dollar total "
-            "but different event groupings are NEVER deduped — they represent "
-            "genuinely different assignments."
+            "Turn ON to collapse scenarios where the bin labels differ but "
+            "the figures per bin and the event groupings are identical.\n\n"
+            "Turn OFF if the bins are not interchangeable (e.g., different "
+            "sizes) AND you want to see all possible bin assignments."
         ),
     )
 
