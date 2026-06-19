@@ -4,6 +4,7 @@ import json
 import os
 from datetime import date, timedelta
 from itertools import product
+import streamlit.components.v1 as components
 
 
 # ──────────────────────────────────────────────
@@ -23,7 +24,6 @@ TYPE_DISPLAY = {
 # Formatting helpers
 # ──────────────────────────────────────────────
 def fmt_fee(amount, ext_days=None, show_days=True):
-    """Format a fee as $X or $X (Yd)."""
     if show_days and ext_days is not None:
         return f"${amount:,.0f} ({ext_days}d)"
     return f"${amount:,.0f}"
@@ -78,7 +78,6 @@ def is_valid_assignment(events, assignment, delivery_dates):
 
 
 def deduplicate_scenarios(results):
-    """Collapse only TRULY identical scenarios."""
     seen = {}
     for r in results:
         bin_sets = []
@@ -125,9 +124,12 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
             )
         total = sum(fees.values())
 
+        # Sum extension days across all bins
         total_ext_days = 0
         for b in breakdowns:
-            for c in breakdownstotal_ext_days += c["ext_days"]
+            bin_cycles = breakdowns[b]
+            for c in bin_cycles:
+                total_ext_days = total_ext_days + c["ext_days"]
 
         results.append({
             "combo": combo,
@@ -254,7 +256,7 @@ def build_decision_tree_dot(events, fixed_assignments, num_bins, delivery_dates,
                             _, bd = fee_for_bin(bins_map[b], bin_delivery, free_days, rate_per_day)
                             ext_sum = sum(c["ext_days"] for c in bd)
                             per_bin_ext[b] = ext_sum
-                            total_ext += ext_sum
+                            total_ext = total_ext + ext_sum
 
                         leaf_lines = [f"Total: {total_ext}d"]
                         for b in sorted(bins_map.keys()):
@@ -475,10 +477,9 @@ def render_results(results, events, num_bins, customer, delivery_dates,
 - ⬜ **White boxes** = "Which bin?" decision points
 - 🟢 **Light green boxes** = valid leaf (total + per-bin extension days)
 - 🔴 **Pink boxes** = invalid (event predates bin's delivery, or duplicate repo)
-- 🟩 **Bright green path** = the scenario currently selected above (pick a different scenario to re-highlight)
+- 🟩 **Bright green path** = the scenario currently selected above
 - **Arrow labels:** "Service date → Bin N" with **+Nd** showing extension days added
-- **Tree shows days only** (dollar amounts are in the scenario table + breakdown below)
-- Both bins appear in one tree because every decision affects both
+- Tree shows **days only** (dollars in scenario table + breakdown below)
                     """
                 )
             except Exception as ex:
@@ -487,9 +488,9 @@ def render_results(results, events, num_bins, customer, delivery_dates,
     if show_timeline:
         st.subheader("📅 Per-bin timeline (for selected scenario)")
         st.caption(
-            "Each bin shown as a horizontal sequence: Delivery → Service → Service. "
-            "Yellow boxes = cycles with extension days. Green boxes = within free days. "
-            "Red arrows highlight cycles that ran over."
+            "Each bin as a horizontal sequence: Delivery → Service → Service. "
+            "Yellow = cycles with extension days. Green = within free days. "
+            "Red arrows = cycles that ran over."
         )
         timeline_dot = build_timeline_view(
             selected_scenario, num_bins, delivery_dates, free_days
@@ -568,23 +569,38 @@ with st.sidebar:
     show_tree = st.checkbox(
         "🌳 Show decision tree",
         value=False,
-        help="Tree showing all allocation possibilities (days-only labels to reduce clutter).",
+        help="Tree showing all allocation possibilities (days-only labels).",
     )
     show_timeline = st.checkbox(
         "📅 Show per-bin timeline",
         value=False,
-        help="Alternative view: each bin as its own horizontal swim lane.",
+        help="Alternative view: each bin as a horizontal swim lane.",
     )
     show_days = st.checkbox(
         "📊 Show days alongside dollars",
         value=True,
-        help="Adds extension day counts next to dollar amounts in tables/metrics.",
+        help="Adds extension day counts next to dollar amounts.",
     )
     interchangeable = st.checkbox(
         "🔁 Hide duplicate scenarios",
         value=True,
         help="Collapse scenarios with identical totals and bin-fee distributions.",
     )
+
+    st.divider()
+    with st.expander("⌨️ Keyboard tips"):
+        st.markdown(
+            """
+**In the events table:**
+- **Arrow keys** = move between cells (most reliable)
+- **Enter** = confirm and stay
+- **Tab** = next cell (sometimes escapes table — use arrows instead)
+- **Esc** = exit a cell editor
+
+**Global shortcuts:**
+- **Ctrl + Enter** = run Calculate (works from anywhere)
+"""
+        )
 
 
 with tab1:
@@ -639,10 +655,14 @@ with tab1:
     errors = []
 
     if input_mode == "📋 Table (paste from Excel)":
+        st.info(
+            "💡 **Navigation tips:** Use **arrow keys** to move between cells reliably. "
+            "Tab can sometimes jump outside the table — if that happens, click back into the cell you need. "
+            "Press **Ctrl+Enter** anytime to run Calculate."
+        )
         st.caption(
             "🔄 **Auto-sync rules:** Return date clears when Type = S/Repo. "
-            "For S/Rtn, return date follows haul date until manually overridden. "
-            "Sync takes effect on your next interaction (click another cell, etc.)."
+            "For S/Rtn, return date follows haul date until manually overridden."
         )
 
         earliest_delivery = min(delivery_dates.values())
@@ -694,7 +714,7 @@ with tab1:
             key="events_table",
         )
 
-        # Apply auto-sync rules WITHOUT forced rerun (lets typing land naturally)
+        # Auto-sync rules WITHOUT forced rerun
         sync_state = st.session_state["row_sync_state"]
         previous_df = st.session_state["events_table_df"]
         synced_df = edited_df.copy()
@@ -705,11 +725,9 @@ with tab1:
             row_return = synced_df.at[idx, "Return date"]
             row_bin = synced_df.at[idx, "Bin (if known)"]
 
-            # Default new rows' Bin to "Unknown" if it ended up empty/None
+            # Default new rows
             if pd.isna(row_bin) or row_bin is None or row_bin == "":
                 synced_df.at[idx, "Bin (if known)"] = "Unknown"
-
-            # Default new rows' Type to "S/Rtn" if missing
             if pd.isna(row_type) or row_type is None or row_type == "":
                 synced_df.at[idx, "Type"] = "S/Rtn"
                 row_type = "S/Rtn"
@@ -732,7 +750,6 @@ with tab1:
                 if not pd.isna(row_return):
                     synced_df.at[idx, "Return date"] = pd.NaT
                 sync_state[idx] = True
-
             elif row_type == "S/Rtn":
                 if pd.isna(row_return):
                     synced_df.at[idx, "Return date"] = row_haul
@@ -786,7 +803,14 @@ with tab1:
                 "fix before calculating."
             )
 
-        if st.button("🧮 Calculate all scenarios", type="primary", key="calc_table"):
+        # Calculate button RIGHT after the table to minimize tab confusion
+        calc_clicked = st.button(
+            "🧮 Calculate all scenarios (or press Ctrl+Enter)",
+            type="primary",
+            key="calc_table",
+        )
+
+        if calc_clicked:
             for i, row in edited_df.iterrows():
                 haul = row["Haul date"]
                 ev_type = row["Type"]
@@ -798,7 +822,6 @@ with tab1:
                 if hasattr(haul, "date"):
                     haul = haul.date()
 
-                # Default fallbacks
                 if pd.isna(ev_type) or ev_type is None or ev_type == "":
                     ev_type = "S/Rtn"
                 if pd.isna(bin_choice) or bin_choice is None or bin_choice == "":
@@ -920,7 +943,11 @@ with tab1:
                 fixed[i] = int(bin_choice.split()[-1])
             st.divider()
 
-        if st.button("🧮 Calculate all scenarios", type="primary", key="calc_picker"):
+        if st.button(
+            "🧮 Calculate all scenarios (or press Ctrl+Enter)",
+            type="primary",
+            key="calc_picker",
+        ):
             if errors:
                 for err in errors:
                     st.error(err)
@@ -941,6 +968,32 @@ with tab1:
                     "rate": rate,
                     "saved_to_history": False,
                 }
+
+    # Ctrl+Enter shortcut: click the Calculate button via JavaScript
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            if (doc._ctrlEnterAttached) return;
+            doc._ctrlEnterAttached = true;
+            doc.addEventListener('keydown', function(e) {
+                if (e.ctrlKey && e.key === 'Enter') {
+                    const buttons = doc.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        if (btn.innerText && btn.innerText.includes('Calculate all scenarios')) {
+                            btn.click();
+                            e.preventDefault();
+                            return;
+                        }
+                    }
+                }
+            });
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
     if "last_results" in st.session_state:
         cached = st.session_state["last_results"]
