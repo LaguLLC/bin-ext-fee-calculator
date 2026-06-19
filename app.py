@@ -10,7 +10,134 @@ import streamlit.components.v1 as components
 # ──────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────
-SERVICE_RETURN = "serviceins:SERVICE_RETURN = "service_return"
+SERVICE_RETURN = "service_return"
+REPO = "repo"
+HISTORY_FILE = "history.json"
+
+TYPE_DISPLAY = {
+    "S/Rtn": SERVICE_RETURN,
+    "S/Repo": REPO,
+}
+
+
+# ──────────────────────────────────────────────
+# Formatting helpers
+# ──────────────────────────────────────────────
+def fmt_fee(amount, ext_days=None, show_days=True):
+    if show_days and ext_days is not None:
+        return f"${amount:,.0f} ({ext_days}d)"
+    return f"${amount:,.0f}"
+
+
+# ──────────────────────────────────────────────
+# Core fee calculation
+# ──────────────────────────────────────────────
+def fee_for_bin(bin_events, bin_delivery_date, free_days, rate_per_day):
+    if not bin_events:
+        return 0, []
+    fee = 0
+    breakdown = []
+    cycle_start = bin_delivery_date
+    for ev in bin_events:
+        cycle_days = (ev["haul_date"] - cycle_start).days + 1
+        ext_days = max(0, cycle_days - free_days)
+        cycle_fee = ext_days * rate_per_day
+        fee += cycle_fee
+        breakdown.append({
+            "cycle_start": cycle_start,
+            "haul_date": ev["haul_date"],
+            "cycle_days": cycle_days,
+            "ext_days": ext_days,
+            "fee": cycle_fee,
+        })
+        if ev["type"] == REPO:
+            break
+        cycle_start = ev["return_date"]
+    return fee, breakdown
+
+
+def is_valid_assignment(events, assignment, delivery_dates):
+    bins = {}
+    for i, ev in enumerate(events):
+        b = assignment[i]
+        bins.setdefault(b, []).append(ev)
+    for b, bin_events in bins.items():
+        bin_events.sort(key=lambda e: e["haul_date"])
+        repo_idx = [i for i, e in enumerate(bin_events) if e["type"] == REPO]
+        if len(repo_idx) > 1:
+            return False
+        if repo_idx and repo_idx[0] != len(bin_events) - 1:
+            return False
+        bin_start = delivery_dates.get(b)
+        if bin_start is None:
+            return False
+        for e in bin_events:
+            if e["haul_date"] < bin_start:
+                return False
+    return True
+
+
+def deduplicate_scenarios(results):
+    """
+    Collapse scenarios that are equivalent permutations of each other.
+
+    A "duplicate" means two scenarios that:
+    1. Have the SAME canonical event grouping (same set of events per bin,
+       just possibly with bin labels swapped — i.e., mirror permutations), AND
+    2. Produce the SAME per-bin fee distribution (so the math truly matches —
+       this prevents wrongly merging staggered-delivery cases where swapping
+       which bin handles which events DOES change the totals).
+
+    Two scenarios with the same dollar total but different event groupings
+    are NOT considered duplicates (they're genuinely different assignments).
+    """
+    seen = {}
+    for r in results:
+        # Build canonical event grouping (bin labels neutralized)
+        bin_sets = []
+        for b in sorted(r["assignment"].keys()):
+            event_tuple = tuple(sorted(r["assignment"][b]))
+            bin_sets.append(event_tuple)
+        canonical_events = tuple(sorted(bin_sets))
+
+        # Per-bin fee tuple (also sorted to neutralize bin labels) — guards
+        # against staggered-delivery cases where mirror permutations would
+        # otherwise be deduped but produce different actual math.
+        fee_tuple = tuple(sorted(r["fees"].values()))
+
+        canonical = (canonical_events, fee_tuple)
+        if canonical not in seen:
+            seen[canonical] = r
+
+    deduped = sorted(seen.values(), key=lambda x: x["total"])
+    removed = len(results) - len(deduped)
+    return deduped, removed
+
+
+def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
+                          fixed_assignments=None, num_bins=2):
+    fixed_assignments = fixed_assignments or {}
+    n = len(events)
+    free_indices = [i for i in range(n) if i not in fixed_assignments]
+
+    results = []
+    for combo in product(range(1, num_bins + 1), repeat=len(free_indices)):
+        assignment = dict(fixed_assignments)
+        for idx, bin_num in zip(free_indices, combo):
+            assignment[idx] = bin_num
+
+        if not is_valid_assignment(events, assignment, delivery_dates):
+            continue
+
+        bins = {b: [] for b in range(1, num_bins + 1)}
+        for i, ev in enumerate(events):
+            bins[assignment[i]].append(ev)
+        for b in bins:
+            bins[b].sort(key=lambda e: e["haul_date"])
+
+        fees = {}
+        breakdowns = {}
+        for b in bins:
             bin_delivery = delivery_dates.get(b)
             fees[b], breakdowns[b] = fee_for_bin(
                 bins[b], bin_delivery, free_days, rate_per_day
@@ -308,13 +435,28 @@ def render_results(results, events, num_bins, customer, delivery_dates,
         )
         return
 
+    # Detect: dedupe is OFF AND at least one event has Unknown bin
+    has_unknown_bins = len(events) > len(fixed_assignments)
+    if (not interchangeable) and has_unknown_bins:
+        st.warning(
+            "⚠️ You have rows with unknown bin assignments and "
+            "**Hide equivalent permutations** is off. You'll see all possible "
+            "permutations — including ones that are mirror images of each "
+            "other (same event groupings, just with bin labels swapped). "
+            "Consider turning on **Hide equivalent permutations** if you only "
+            "need distinct outcomes."
+        )
+
     removed_count = 0
     if interchangeable:
         results, removed_count = deduplicate_scenarios(results)
 
     msg = f"Found {len(results)} valid scenario(s) across {len(events)} event(s)."
     if removed_count > 0:
-        msg += f" Hid {removed_count} duplicate(s) (same total + same bin distribution)."
+        msg += (
+            f" Hid {removed_count} equivalent permutation(s) "
+            "(mirror assignments that produce identical math)."
+        )
     st.success(msg)
 
     lowest = results[0]["total"]
@@ -474,9 +616,15 @@ with st.sidebar:
         help="Adds extension day counts next to dollar amounts.",
     )
     interchangeable = st.checkbox(
-        "🔁 Hide duplicate scenarios",
+        "🔁 Hide equivalent permutations",
         value=True,
-        help="Collapse scenarios with identical totals and bin-fee distributions.",
+        help=(
+            "Collapses scenarios that are mirror images of each other — same "
+            "event groupings, just with bin labels swapped, AND that produce "
+            "identical per-bin math. Two scenarios with the same dollar total "
+            "but different event groupings are NEVER deduped — they represent "
+            "genuinely different assignments."
+        ),
     )
 
     st.divider()
@@ -620,7 +768,6 @@ with tab1:
             row_return = synced_df.at[idx, "Return date"]
             row_bin = synced_df.at[idx, "Bin (if known)"]
 
-            # Fill missing defaults for brand-new rows
             if pd.isna(row_bin) or row_bin is None or row_bin == "":
                 synced_df.at[idx, "Bin (if known)"] = "Unknown"
             if pd.isna(row_type) or row_type is None or row_type == "":
@@ -635,7 +782,6 @@ with tab1:
                 prior_haul = prior_df.at[idx, "Haul date"]
                 prior_return = prior_df.at[idx, "Return date"]
 
-            # Rule 1: Type changed FROM S/Repo TO S/Rtn -> fill return with haul date
             if prior_type == "S/Repo" and row_type == "S/Rtn":
                 if not pd.isna(row_haul):
                     synced_df.at[idx, "Return date"] = row_haul
@@ -643,7 +789,6 @@ with tab1:
                     anything_changed = True
                 continue
 
-            # Rule 2: Type is S/Repo -> always blank return date
             if row_type == "S/Repo":
                 if not pd.isna(row_return):
                     synced_df.at[idx, "Return date"] = pd.NaT
@@ -651,14 +796,12 @@ with tab1:
                 overrides[idx] = False
                 continue
 
-            # Rule 3: S/Rtn with blank return -> fill with haul date
             if row_type == "S/Rtn" and pd.isna(row_return) and not pd.isna(row_haul):
                 synced_df.at[idx, "Return date"] = row_haul
                 overrides[idx] = False
                 anything_changed = True
                 continue
 
-            # Rule 4: User manually changed return date -> mark as overridden
             if (
                 row_type == "S/Rtn"
                 and not pd.isna(row_return)
@@ -672,7 +815,6 @@ with tab1:
                     overrides[idx] = True
                 continue
 
-            # Rule 5: Haul date changed AND row not overridden -> return follows haul
             if (
                 row_type == "S/Rtn"
                 and not pd.isna(row_haul)
@@ -696,7 +838,6 @@ with tab1:
 
         edited_df = synced_df
 
-        # ─── Validation warning ─────────────────────────────────────────
         invalid_idxs = []
         for idx in edited_df.index:
             row_type = edited_df.at[idx, "Type"]
@@ -879,7 +1020,6 @@ with tab1:
                     "saved_to_history": False,
                 }
 
-    # Ctrl+Enter shortcut
     components.html(
         """
         <script>
@@ -987,109 +1127,3 @@ with tab2:
             if st.button("🗑️ Clear all history"):
                 save_history([])
                 st.success("History cleared. Refresh the page to see the empty state.")
-REPO = "repo"
-HISTORY_FILE = "history.json"
-
-TYPE_DISPLAY = {
-    "S/Rtn": SERVICE_RETURN,
-    "S/Repo": REPO,
-}
-
-
-# ──────────────────────────────────────────────
-# Formatting helpers
-# ──────────────────────────────────────────────
-def fmt_fee(amount, ext_days=None, show_days=True):
-    if show_days and ext_days is not None:
-        return f"${amount:,.0f} ({ext_days}d)"
-    return f"${amount:,.0f}"
-
-
-# ──────────────────────────────────────────────
-# Core fee calculation
-# ──────────────────────────────────────────────
-def fee_for_bin(bin_events, bin_delivery_date, free_days, rate_per_day):
-    if not bin_events:
-        return 0, []
-    fee = 0
-    breakdown = []
-    cycle_start = bin_delivery_date
-    for ev in bin_events:
-        cycle_days = (ev["haul_date"] - cycle_start).days + 1
-        ext_days = max(0, cycle_days - free_days)
-        cycle_fee = ext_days * rate_per_day
-        fee += cycle_fee
-        breakdown.append({
-            "cycle_start": cycle_start,
-            "haul_date": ev["haul_date"],
-            "cycle_days": cycle_days,
-            "ext_days": ext_days,
-            "fee": cycle_fee,
-        })
-        if ev["type"] == REPO:
-            break
-        cycle_start = ev["return_date"]
-    return fee, breakdown
-
-
-def is_valid_assignment(events, assignment, delivery_dates):
-    bins = {}
-    for i, ev in enumerate(events):
-        b = assignment[i]
-        bins.setdefault(b, []).append(ev)
-    for b, bin_events in bins.items():
-        bin_events.sort(key=lambda e: e["haul_date"])
-        repo_idx = [i for i, e in enumerate(bin_events) if e["type"] == REPO]
-        if len(repo_idx) > 1:
-            return False
-        if repo_idx and repo_idx[0] != len(bin_events) - 1:
-            return False
-        bin_start = delivery_dates.get(b)
-        if bin_start is None:
-            return False
-        for e in bin_events:
-            if e["haul_date"] < bin_start:
-                return False
-    return True
-
-
-def deduplicate_scenarios(results):
-    seen = {}
-    for r in results:
-        bin_sets = []
-        for b in sorted(r["assignment"].keys()):
-            event_tuple = tuple(sorted(r["assignment"][b]))
-            bin_sets.append(event_tuple)
-        canonical_events = tuple(sorted(bin_sets))
-        fee_tuple = tuple(sorted(r["fees"].values()))
-        canonical = (canonical_events, fee_tuple, r["total"])
-        if canonical not in seen:
-            seen[canonical] = r
-    deduped = sorted(seen.values(), key=lambda x: x["total"])
-    removed = len(results) - len(deduped)
-    return deduped, removed
-
-
-def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
-                          fixed_assignments=None, num_bins=2):
-    fixed_assignments = fixed_assignments or {}
-    n = len(events)
-    free_indices = [i for i in range(n) if i not in fixed_assignments]
-
-    results = []
-    for combo in product(range(1, num_bins + 1), repeat=len(free_indices)):
-        assignment = dict(fixed_assignments)
-        for idx, bin_num in zip(free_indices, combo):
-            assignment[idx] = bin_num
-
-        if not is_valid_assignment(events, assignment, delivery_dates):
-            continue
-
-        bins = {b: [] for b in range(1, num_bins + 1)}
-        for i, ev in enumerate(events):
-            bins[assignment[i]].append(ev)
-        for b in bins:
-            bins[b].sort(key=lambda e: e["haul_date"])
-
-        fees = {}
-        breakdowns = {}
