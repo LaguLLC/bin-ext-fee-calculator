@@ -78,16 +78,6 @@ def is_valid_assignment(events, assignment, delivery_dates):
 
 
 def deduplicate_scenarios(results):
-    """
-    Collapse scenarios that are equivalent permutations of each other.
-
-    A "duplicate" means two scenarios that:
-    1. Have the SAME canonical event grouping (same set of events per bin,
-       just possibly with bin labels swapped), AND
-    2. Produce the SAME per-bin fee distribution (so the math truly matches —
-       this prevents wrongly merging staggered-delivery cases where swapping
-       which bin handles which events DOES change the totals).
-    """
     seen = {}
     for r in results:
         bin_sets = []
@@ -99,7 +89,6 @@ def deduplicate_scenarios(results):
         canonical = (canonical_events, fee_tuple)
         if canonical not in seen:
             seen[canonical] = r
-
     deduped = sorted(seen.values(), key=lambda x: x["total"])
     removed = len(results) - len(deduped)
     return deduped, removed
@@ -385,7 +374,7 @@ def build_timeline_view(scenario, num_bins, delivery_dates, free_days):
 
 
 # ──────────────────────────────────────────────
-# History storage
+# History storage + reload helpers
 # ──────────────────────────────────────────────
 def load_history():
     if not os.path.exists(HISTORY_FILE):
@@ -402,13 +391,21 @@ def save_history(entries):
         json.dump(entries, f, indent=2, default=str)
 
 
-def add_to_history(customer, delivery_dates, events, results):
+def add_to_history(customer, delivery_dates, events, results,
+                   free_days, rate, num_bins, fixed_assignments):
     history = load_history()
     min_ext = results[0].get("total_ext_days", 0) if results else 0
     max_ext = results[-1].get("total_ext_days", 0) if results else 0
+
+    fixed_serialized = {str(k): int(v) for k, v in fixed_assignments.items()}
+
     history.append({
         "customer": customer,
         "delivery_dates": {str(b): str(d) for b, d in delivery_dates.items()},
+        "free_days": int(free_days),
+        "rate": float(rate),
+        "num_bins": int(num_bins),
+        "fixed_assignments": fixed_serialized,
         "events": [
             {
                 "label": e["label"],
@@ -427,8 +424,63 @@ def add_to_history(customer, delivery_dates, events, results):
     save_history(history)
 
 
+def parse_record_to_calc_inputs(rec):
+    """Convert a stored history record back into dict of calc inputs."""
+    events = []
+    for e in rec["events"]:
+        haul = date.fromisoformat(e["haul_date"])
+        return_d = date.fromisoformat(e["return_date"])
+        events.append({
+            "label": e["label"],
+            "haul_date": haul,
+            "return_date": return_d,
+            "type": e["type"],
+        })
+
+    if "delivery_dates" in rec:
+        delivery_dates = {
+            int(k): date.fromisoformat(v)
+            for k, v in rec["delivery_dates"].items()
+        }
+    else:
+        single = date.fromisoformat(rec.get("delivery_date", str(date.today())))
+        delivery_dates = {1: single, 2: single}
+
+    free_days = rec.get("free_days", 10)
+    rate = rec.get("rate", 50.0)
+    num_bins = rec.get("num_bins", len(delivery_dates))
+
+    fixed_raw = rec.get("fixed_assignments", {})
+    fixed = {}
+    if fixed_raw:
+        fixed = {int(k): int(v) for k, v in fixed_raw.items()}
+
+    return {
+        "events": events,
+        "delivery_dates": delivery_dates,
+        "free_days": free_days,
+        "rate": rate,
+        "num_bins": num_bins,
+        "fixed_assignments": fixed,
+    }
+
+
+def recompute_from_record(rec):
+    """Recompute allocation results from a stored history record."""
+    parsed = parse_record_to_calc_inputs(rec)
+    results = calculate_allocations(
+        parsed["delivery_dates"],
+        parsed["free_days"],
+        parsed["rate"],
+        parsed["events"],
+        parsed["fixed_assignments"],
+        parsed["num_bins"],
+    )
+    return results, parsed
+
+
 # ──────────────────────────────────────────────
-# Render results
+# Render: full results (for calculator)
 # ──────────────────────────────────────────────
 def render_results(results, events, num_bins, customer, delivery_dates,
                    show_tree, fixed_assignments, free_days, rate_per_day,
@@ -563,7 +615,16 @@ def render_results(results, events, num_bins, customer, delivery_dates,
     if customer.strip():
         last = st.session_state.get("last_results", {})
         if not last.get("saved_to_history", False):
-            add_to_history(customer.strip(), delivery_dates, events, results)
+            add_to_history(
+                customer.strip(),
+                delivery_dates,
+                events,
+                results,
+                free_days,
+                rate_per_day,
+                num_bins,
+                fixed_assignments,
+            )
             if "last_results" in st.session_state:
                 st.session_state["last_results"]["saved_to_history"] = True
             st.info(f"✅ Saved to history under: **{customer.strip()}**")
@@ -571,6 +632,209 @@ def render_results(results, events, num_bins, customer, delivery_dates,
             st.caption(f"📌 Already saved to history under: **{customer.strip()}**")
     else:
         st.caption("ℹ️ Customer name was blank — not saved to history.")
+
+
+# ──────────────────────────────────────────────
+# Render: static view of a history record
+# ──────────────────────────────────────────────
+def render_static_view_of_record(rec, show_days):
+    """Read-only display of a saved history record's results."""
+    try:
+        results, parsed = recompute_from_record(rec)
+    except Exception as ex:
+        st.warning(f"Could not parse record: {ex}")
+        return
+
+    if not results:
+        st.warning("Could not recompute results — original record may have invalid data.")
+        return
+
+    deliv_strs = sorted(set(str(d) for d in parsed["delivery_dates"].values()))
+    deliv_text = ", ".join(deliv_strs)
+
+    st.caption(
+        f"📅 Delivery: {deliv_text} | "
+        f"⏱️ Free days: {parsed['free_days']} | "
+        f"💰 Rate: ${parsed['rate']:.2f}/day | "
+        f"🗑️ Bins: {parsed['num_bins']} | "
+        f"📋 Events: {len(parsed['events'])}"
+    )
+
+    lowest = results[0]["total"]
+    highest = results[-1]["total"]
+    lowest_ext = results[0].get("total_ext_days", 0)
+    highest_ext = results[-1].get("total_ext_days", 0)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Lowest fee", fmt_fee(lowest, lowest_ext, show_days))
+    m2.metric("Highest fee", fmt_fee(highest, highest_ext, show_days))
+    m3.metric("Scenarios", len(results))
+
+    table_rows = []
+    num_bins = parsed["num_bins"]
+    for i, r in enumerate(results, 1):
+        row = {"#": i}
+        for b in range(1, num_bins + 1):
+            services_list = r["assignment"][b]
+            row[f"Bin {b}"] = ", ".join(services_list) if services_list else "(none)"
+        for b in range(1, num_bins + 1):
+            bin_fee = r["fees"][b]
+            bin_ext = sum(c["ext_days"] for c in r["breakdowns"][b])
+            row[f"Bin {b} Fee"] = fmt_fee(bin_fee, bin_ext, show_days)
+        row["Total"] = fmt_fee(r["total"], r.get("total_ext_days", 0), show_days)
+        table_rows.append(row)
+    st.dataframe(table_rows, use_container_width=True)
+
+
+# ──────────────────────────────────────────────
+# Render: compare two records
+# ──────────────────────────────────────────────
+def render_record_comparison(rec_a, rec_b, show_days):
+    """Side-by-side comparison of two records."""
+    try:
+        results_a, parsed_a = recompute_from_record(rec_a)
+        results_b, parsed_b = recompute_from_record(rec_b)
+    except Exception as ex:
+        st.warning(f"Could not parse records: {ex}")
+        return
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown(f"### 🅰️ {rec_a['customer']}")
+        st.caption(f"Logged: {rec_a.get('logged_at', '—')}")
+        if results_a:
+            lowest_a = results_a[0]["total"]
+            highest_a = results_a[-1]["total"]
+            lowest_ext_a = results_a[0].get("total_ext_days", 0)
+            highest_ext_a = results_a[-1].get("total_ext_days", 0)
+            st.metric("Lowest", fmt_fee(lowest_a, lowest_ext_a, show_days))
+            st.metric("Highest", fmt_fee(highest_a, highest_ext_a, show_days))
+            st.metric("Scenarios", len(results_a))
+            st.write(f"📋 Events: {len(parsed_a['events'])}")
+            st.write(f"⏱️ Free days: {parsed_a['free_days']}")
+            st.write(f"💰 Rate: ${parsed_a['rate']:.2f}/day")
+        else:
+            st.warning("No valid scenarios")
+
+    with col_b:
+        st.markdown(f"### 🅱️ {rec_b['customer']}")
+        st.caption(f"Logged: {rec_b.get('logged_at', '—')}")
+        if results_b:
+            lowest_b = results_b[0]["total"]
+            highest_b = results_b[-1]["total"]
+            lowest_ext_b = results_b[0].get("total_ext_days", 0)
+            highest_ext_b = results_b[-1].get("total_ext_days", 0)
+            st.metric("Lowest", fmt_fee(lowest_b, lowest_ext_b, show_days))
+            st.metric("Highest", fmt_fee(highest_b, highest_ext_b, show_days))
+            st.metric("Scenarios", len(results_b))
+            st.write(f"📋 Events: {len(parsed_b['events'])}")
+            st.write(f"⏱️ Free days: {parsed_b['free_days']}")
+            st.write(f"💰 Rate: ${parsed_b['rate']:.2f}/day")
+        else:
+            st.warning("No valid scenarios")
+
+    st.divider()
+    st.markdown("**🔍 Differences (B minus A)**")
+    if results_a and results_b:
+        diff_lowest = results_b[0]["total"] - results_a[0]["total"]
+        diff_highest = results_b[-1]["total"] - results_a[-1]["total"]
+        d1, d2 = st.columns(2)
+        d1.metric("Lowest", f"${diff_lowest:+,.0f}")
+        d2.metric("Highest", f"${diff_highest:+,.0f}")
+
+
+# ──────────────────────────────────────────────
+# Render: re-run a record with new terms
+# ──────────────────────────────────────────────
+def render_rerun_results(rec, new_free_days, new_rate, show_days):
+    """Re-run a record with new free days / rate."""
+    try:
+        parsed = parse_record_to_calc_inputs(rec)
+    except Exception as ex:
+        st.warning(f"Could not parse record: {ex}")
+        return
+
+    results = calculate_allocations(
+        parsed["delivery_dates"],
+        new_free_days,
+        new_rate,
+        parsed["events"],
+        parsed["fixed_assignments"],
+        parsed["num_bins"],
+    )
+
+    if not results:
+        st.warning("No valid scenarios with these new terms.")
+        return
+
+    lowest = results[0]["total"]
+    highest = results[-1]["total"]
+    lowest_ext = results[0].get("total_ext_days", 0)
+    highest_ext = results[-1].get("total_ext_days", 0)
+
+    orig_min = rec.get("min_total", 0)
+    orig_max = rec.get("max_total", 0)
+
+    st.markdown(
+        f"**Original:** {parsed['free_days']} free days @ "
+        f"${parsed['rate']:.2f}/day → ${orig_min:,.0f} – ${orig_max:,.0f}"
+    )
+    st.markdown(f"**New:** {new_free_days} free days @ ${new_rate:.2f}/day")
+
+    diff_low = lowest - orig_min
+    diff_high = highest - orig_max
+
+    m1, m2 = st.columns(2)
+    m1.metric(
+        "Lowest fee (new)",
+        fmt_fee(lowest, lowest_ext, show_days),
+        delta=f"${diff_low:+,.0f}",
+    )
+    m2.metric(
+        "Highest fee (new)",
+        fmt_fee(highest, highest_ext, show_days),
+        delta=f"${diff_high:+,.0f}",
+    )
+
+    table_rows = []
+    num_bins = parsed["num_bins"]
+    for i, r in enumerate(results, 1):
+        row = {"#": i}
+        for b in range(1, num_bins + 1):
+            services_list = r["assignment"][b]
+            row[f"Bin {b}"] = ", ".join(services_list) if services_list else "(none)"
+        row["Total"] = fmt_fee(r["total"], r.get("total_ext_days", 0), show_days)
+        table_rows.append(row)
+    st.dataframe(table_rows, use_container_width=True)
+
+
+# ──────────────────────────────────────────────
+# Reload record into the calculator session state
+# ──────────────────────────────────────────────
+def reload_record_to_calculator(rec):
+    parsed = parse_record_to_calc_inputs(rec)
+
+    results = calculate_allocations(
+        parsed["delivery_dates"],
+        parsed["free_days"],
+        parsed["rate"],
+        parsed["events"],
+        parsed["fixed_assignments"],
+        parsed["num_bins"],
+    )
+
+    st.session_state["last_results"] = {
+        "results": results,
+        "events": parsed["events"],
+        "num_bins": parsed["num_bins"],
+        "customer": rec["customer"],
+        "delivery_dates": parsed["delivery_dates"],
+        "fixed": parsed["fixed_assignments"],
+        "free_days": parsed["free_days"],
+        "rate": parsed["rate"],
+        "saved_to_history": True,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -618,11 +882,7 @@ with st.sidebar:
     hide_invalid_leaves = st.checkbox(
         "🚫 Hide invalid leaves from tree",
         value=True,
-        help=(
-            "Skip branches that lead to impossible scenarios "
-            "(e.g., an event predating its bin's delivery date). "
-            "Reduces clutter when staggered delivery rules out many permutations."
-        ),
+        help="Skip branches that lead to impossible scenarios.",
         disabled=not show_tree,
     )
     show_timeline = st.checkbox(
@@ -662,6 +922,9 @@ with st.sidebar:
         )
 
 
+# ──────────────────────────────────────────────
+# Tab 1: Calculator
+# ──────────────────────────────────────────────
 with tab1:
     col_a, col_b = st.columns([1, 1])
     with col_a:
@@ -988,161 +1251,4 @@ with tab1:
 
                     if return_date != haul:
                         st.session_state[override_key] = True
-                    elif return_date == haul and has_override:
-                        st.session_state[override_key] = False
-                else:
-                    return_date = haul
-                    st.markdown("_(rental ends — no return date)_")
-
-            with c4:
-                bin_choice = st.selectbox("Bin (if known)", bin_options, key=f"bin{i}")
-
-            if return_date < haul:
-                errors.append(
-                    f"Event {i+1}: Return date ({return_date}) is before haul date ({haul})."
-                )
-
-            events.append({
-                "label": haul.strftime("%b %d"),
-                "haul_date": haul,
-                "return_date": return_date,
-                "type": TYPE_DISPLAY.get(ev_type, SERVICE_RETURN),
-            })
-            if bin_choice != "Unknown":
-                fixed[i] = int(bin_choice.split()[-1])
-            st.divider()
-
-        if st.button(
-            "🧮 Calculate all scenarios (or press Ctrl+Enter)",
-            type="primary",
-            key="calc_picker",
-        ):
-            if errors:
-                for err in errors:
-                    st.error(err)
-            elif not events:
-                st.warning("Please add at least one event before calculating.")
-            else:
-                results = calculate_allocations(
-                    delivery_dates, free_days, rate, events, fixed, int(num_bins)
-                )
-                st.session_state["last_results"] = {
-                    "results": results,
-                    "events": events,
-                    "num_bins": int(num_bins),
-                    "customer": customer,
-                    "delivery_dates": dict(delivery_dates),
-                    "fixed": dict(fixed),
-                    "free_days": free_days,
-                    "rate": rate,
-                    "saved_to_history": False,
-                }
-
-    components.html(
-        """
-        <script>
-        (function() {
-            const doc = window.parent.document;
-            if (doc._ctrlEnterAttached) return;
-            doc._ctrlEnterAttached = true;
-            doc.addEventListener('keydown', function(e) {
-                if (e.ctrlKey && e.key === 'Enter') {
-                    const buttons = doc.querySelectorAll('button');
-                    for (const btn of buttons) {
-                        if (btn.innerText && btn.innerText.includes('Calculate all scenarios')) {
-                            btn.click();
-                            e.preventDefault();
-                            return;
-                        }
-                    }
-                }
-            });
-        })();
-        </script>
-        """,
-        height=0,
-    )
-
-    if "last_results" in st.session_state:
-        cached = st.session_state["last_results"]
-        render_results(
-            cached["results"],
-            cached["events"],
-            cached["num_bins"],
-            cached["customer"],
-            cached["delivery_dates"],
-            show_tree,
-            cached["fixed"],
-            cached["free_days"],
-            cached["rate"],
-            interchangeable,
-            show_days,
-            show_timeline,
-            hide_invalid_leaves,
-        )
-
-
-with tab2:
-    st.header("📚 Customer history")
-    history = load_history()
-
-    if not history:
-        st.info("No history yet. Run a calculation with a customer name filled in to start logging.")
-    else:
-        customers = sorted(set(h["customer"] for h in history))
-        selected_customer = st.selectbox("Choose a customer", ["(all customers)"] + customers)
-
-        if selected_customer == "(all customers)":
-            filtered = history
-        else:
-            filtered = [h for h in history if h["customer"] == selected_customer]
-
-        st.write(f"Showing **{len(filtered)}** record(s)")
-
-        rows = []
-        for h in filtered:
-            event_dates = [e["haul_date"] for e in h["events"]]
-            date_range = f"{min(event_dates)} → {max(event_dates)}" if event_dates else "—"
-
-            if "delivery_dates" in h:
-                deliveries = sorted(set(h["delivery_dates"].values()))
-                if len(deliveries) == 1:
-                    delivery_display = deliveries[0]
-                else:
-                    delivery_display = f"{deliveries[0]} → {deliveries[-1]}"
-            else:
-                delivery_display = h.get("delivery_date", "—")
-
-            min_ext = h.get("min_ext_days", None)
-            max_ext = h.get("max_ext_days", None)
-            min_fee_str = fmt_fee(h["min_total"], min_ext, show_days)
-            max_fee_str = fmt_fee(h["max_total"], max_ext, show_days)
-
-            rows.append({
-                "Customer": h["customer"],
-                "Delivery": delivery_display,
-                "Event date range": date_range,
-                "# Events": len(h["events"]),
-                "Scenarios": h["scenario_count"],
-                "Min fee": min_fee_str,
-                "Max fee": max_fee_str,
-                "Logged": h["logged_at"],
-            })
-        st.dataframe(rows, use_container_width=True)
-
-        st.subheader("🔍 View record details")
-        if filtered:
-            idx = st.number_input(
-                "Record # to view",
-                min_value=1,
-                max_value=len(filtered),
-                value=1,
-            )
-            rec = filtered[idx - 1]
-            st.json(rec)
-
-        st.divider()
-        with st.expander("⚠️ Danger zone"):
-            if st.button("🗑️ Clear all history"):
-                save_history([])
-                st.success("History cleared. Refresh the page to see the empty state.")
+                    elif return_date == haul
