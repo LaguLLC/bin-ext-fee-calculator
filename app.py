@@ -3,6 +3,9 @@ import inspect
 import json
 import os
 import re
+import shutil
+import tempfile
+import threading
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from itertools import product
@@ -26,6 +29,9 @@ if not (hasattr(st, "fragment") and hasattr(st, "dialog")):
 SERVICE_RETURN = "service_return"
 REPO = "repo"
 HISTORY_FILE = "history.json"
+HISTORY_PREV = HISTORY_FILE + ".prev"  # last good copy, kept on every write
+MAX_UNDO = 50
+MAX_UNDO_SAVED = 30  # how many undo/redo steps are mirrored to the browser
 
 TYPE_DISPLAY = {
     "S/Rtn": SERVICE_RETURN,
@@ -712,30 +718,72 @@ def _migrate_history(entries):
     return entries, changed
 
 
+@st.cache_resource
+def _history_lock():
+    return threading.RLock()  # one per server process: serialises read-modify-write
+
+
+def _read_history_file(path):
+    with open(path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"{path} is not a list")
+    return data
+
+
 def load_history():
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    try:
-        with open(HISTORY_FILE, "r") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            raise ValueError("history.json is not a list")
-    except Exception:
-        # Keep a copy so a bad file is never silently overwritten.
+    data = None
+    if os.path.exists(HISTORY_FILE):
         try:
-            os.replace(HISTORY_FILE, HISTORY_FILE + ".bak")
-        except OSError:
-            pass
+            data = _read_history_file(HISTORY_FILE)
+        except Exception:
+            # Keep the bad file under its own name so it is never silently overwritten.
+            try:
+                os.replace(HISTORY_FILE, f"{HISTORY_FILE}.corrupt-{now_guam():%y%m%d-%H%M%S}")
+            except OSError:
+                pass
+    if data is None and os.path.exists(HISTORY_PREV):
+        try:
+            data = _read_history_file(HISTORY_PREV)  # fall back to the last good copy
+        except Exception:
+            data = None
+    if data is None:
         return []
     data, _ = _migrate_history(data)
     return data
 
 
 def save_history(entries):
-    tmp = HISTORY_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(entries, f, indent=2, default=str)
-    os.replace(tmp, HISTORY_FILE)  # atomic: never leaves a half-written file
+    """Write to a temp file, force it to disk, keep the previous good file, then swap.
+    A crash or power cut leaves either the old file or the new one, never half of one."""
+    with _history_lock():
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(entries, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(HISTORY_FILE):
+            try:
+                shutil.copyfile(HISTORY_FILE, HISTORY_PREV)
+            except OSError:
+                pass
+        os.replace(tmp, HISTORY_FILE)  # atomic
+        try:  # make the rename itself durable
+            dfd = os.open(os.path.dirname(os.path.abspath(HISTORY_FILE)), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except (OSError, AttributeError):
+            pass
+
+
+def _history_sig():
+    try:
+        st_ = os.stat(HISTORY_FILE)
+        return (st_.st_mtime_ns, st_.st_size)
+    except OSError:
+        return None
 
 
 def unique_version_name(history, customer, name):
@@ -751,6 +799,15 @@ def unique_version_name(history, customer, name):
 def add_to_history(customer, version, delivery_dates, events, results,
                    free_days, rate, num_bins, fixed_assignments,
                    end_basis=BASELINE_BASIS, filters=None, blanks=None):
+    with _history_lock():
+        return _add_to_history_locked(customer, version, delivery_dates, events, results,
+                                      free_days, rate, num_bins, fixed_assignments,
+                                      end_basis, filters, blanks)
+
+
+def _add_to_history_locked(customer, version, delivery_dates, events, results,
+                           free_days, rate, num_bins, fixed_assignments,
+                           end_basis, filters, blanks):
     history = load_history()
     min_ext = results[0].get("total_ext_days", 0) if results else 0
     max_ext = results[-1].get("total_ext_days", 0) if results else 0
@@ -799,9 +856,10 @@ def add_to_history(customer, version, delivery_dates, events, results,
 def delete_history_records(ids):
     """Delete the runs with these ids. Returns how many were removed."""
     ids = set(ids or [])
-    history = load_history()
-    keep = [h for h in history if h.get("id") not in ids]
-    save_history(keep)
+    with _history_lock():
+        history = load_history()
+        keep = [h for h in history if h.get("id") not in ids]
+        save_history(keep)
     return len(history) - len(keep)
 
 
@@ -890,10 +948,16 @@ def recompute_from_record(rec):
 # Date cells (Request / Loaded / Disposal / Return) may be blank. What a blank means:
 #   * Only the date for the chosen billing basis is required to calculate.
 #   * When the FIRST date is entered in an empty row, the other blank date cells in
-#     that row are pre-filled from it (so a plain log date just works).
-#   * After that nothing is ever overwritten by editing a different cell. Clear a
-#     cell to leave it blank; blanks are treated as "same as the nearest filled date"
-#     (see effective_dates).
+#     that row are pre-filled from it (so a plain log date just works). Those cells
+#     are remembered as "auto" (r["auto"]).
+#   * An auto cell FOLLOWS the dates you typed: change one and the auto cells are
+#     re-derived (refresh_auto). The moment you type into a cell yourself it becomes
+#     yours and is never overwritten by editing a different cell.
+#   * Clear a cell to leave it blank; blanks are treated as "same as the nearest
+#     filled date" (see effective_dates).
+#   * Return defaults to the LOADED date (not disposal): when a bin is swapped (empty
+#     dropped, full one loaded, dumped on another day) the customer has a bin on site
+#     from the loaded date. Type a later Return date if the bin was really off site.
 S = st.session_state
 
 TABLE_MODE = "📋 Table (paste from Excel)"
@@ -927,6 +991,7 @@ def seed_row(r):
     d, l, q = r["disposal"], r["loaded"], r["request"]
     if d is None and l is None and q is None:
         return
+    before = {f: r[f] for f in DATE_FIELDS}
     if l is None:
         l = d or q
     if q is None:
@@ -935,9 +1000,32 @@ def seed_row(r):
         d = l or q
     r["disposal"], r["loaded"], r["request"] = d, l, q
     if r["type"] == "S/Rtn" and r["ret"] is None:
-        r["ret"] = d
+        r["ret"] = l  # bin is back on site from the loaded date (swap); see header notes
     if r["type"] == "S/Repo":
         r["ret"] = None
+    auto = r.setdefault("auto", set())
+    for f in DATE_FIELDS:
+        if before[f] is None and r[f] is not None:
+            auto.add(f)
+
+
+def refresh_auto(r):
+    """Re-derive the auto-filled cells from the cells the user typed."""
+    auto = r.setdefault("auto", set())
+    if not auto:
+        return
+    for f in auto:
+        r[f] = None
+    if all(r[f] is None for f in DATE_FIELDS):
+        auto.clear()
+        return
+    e = effective_dates(r)
+    for f in list(auto):
+        if f == "ret" and r["type"] == "S/Repo":
+            r[f] = None
+            auto.discard(f)
+        else:
+            r[f] = e[f]
 
 
 def new_row(disposal=None, rtype="S/Rtn", binsel="Unknown", placeholder=False):
@@ -947,6 +1035,7 @@ def new_row(disposal=None, rtype="S/Rtn", binsel="Unknown", placeholder=False):
         "type": rtype, "bin": binsel,
         "err": {}, "raw": {},   # unreadable text typed into a cell
         "ph": placeholder,      # untouched demo row: the first date edit replaces the whole row
+        "auto": set(),          # date cells pre-filled for the user; they follow the typed ones
     }
     seed_row(r)
     return r
@@ -962,7 +1051,7 @@ def effective_dates(r):
     e_l = l or d or q
     e_d = d or l or q
     e_q = q or l or d
-    e_r = (t or e_d) if r["type"] == "S/Rtn" else e_d
+    e_r = (t or e_l) if r["type"] == "S/Rtn" else e_d  # blank return = back on site at loading
     return {"request": e_q, "loaded": e_l, "disposal": e_d, "ret": e_r}
 
 
@@ -984,13 +1073,63 @@ def _ref_for_row(rows, pos):
     return _anchor()
 
 
-def touch(source):
-    """Call after ANY change to SSOT. source: 'table' | 'picker' | 'other'."""
+def _row_snap(r):
+    out = {f: (r[f].isoformat() if isinstance(r[f], date) else None) for f in DATE_FIELDS}
+    out.update(uid=r["uid"], type=r["type"], bin=r["bin"], err=dict(r.get("err", {})),
+               raw=dict(r.get("raw", {})), ph=bool(r.get("ph")), auto=sorted(r.get("auto", ())))
+    return out
+
+
+def _row_from_snap(x):
+    r = {"uid": int(x["uid"]), "type": x.get("type", "S/Rtn"), "bin": x.get("bin", "Unknown"),
+         "err": dict(x.get("err", {})), "raw": dict(x.get("raw", {})),
+         "ph": bool(x.get("ph")), "auto": set(x.get("auto", []))}
+    for f in DATE_FIELDS:
+        try:
+            r[f] = date.fromisoformat(x[f]) if x.get(f) else None
+        except (TypeError, ValueError):
+            r[f] = None
+    return r
+
+
+def state_snap():
+    """JSON-safe copy of everything undo/redo covers (the event rows)."""
+    return {"rows": [_row_snap(r) for r in S["rows"]], "default": bool(S.get("rows_default", False))}
+
+
+def touch(source, record=True):
+    """Call after ANY change to SSOT. source: 'table' | 'picker' | 'other'.
+    record=False: a housekeeping change that must not become an undo step."""
     S["rev"] += 1
     if source == "table":
         S["tbl_rev"] = S["rev"]
     elif source == "picker":
         S["pick_rev"] = S["rev"]
+    cur, last = state_snap(), S.get("_last_snap")
+    if record and last is not None and cur != last:
+        S["undo"] = (S.get("undo", []) + [last])[-MAX_UNDO:]
+        S["redo"] = []
+    S["_last_snap"] = cur
+
+
+def _apply_snap(snap):
+    S["_last_snap"] = snap
+    S["rows"] = [_row_from_snap(x) for x in snap["rows"]]
+    S["rows_default"] = bool(snap.get("default", False))
+    S["_uid"] = max([S.get("_uid", 0)] + [r["uid"] for r in S["rows"]])
+    touch("other", record=False)  # bumps rev so the table / pickers re-seed
+
+
+def undo_cb():
+    if S.get("undo"):
+        S["redo"] = (S.get("redo", []) + [S["_last_snap"]])[-MAX_UNDO:]
+        _apply_snap(S["undo"].pop())
+
+
+def redo_cb():
+    if S.get("redo"):
+        S["undo"] = (S.get("undo", []) + [S["_last_snap"]])[-MAX_UNDO:]
+        _apply_snap(S["redo"].pop())
 
 
 def sanitize_rows(rows, num_bins):
@@ -1120,10 +1259,13 @@ def apply_cell_edit(r, col, val, ref):
             r["type"] = s
             if s == "S/Repo":
                 r["ret"] = None
+                r["auto"].discard("ret")
                 r["err"].pop(COL_RETURN, None)
                 r["raw"].pop(COL_RETURN, None)
-            elif r["ret"] is None:  # S/Repo -> S/Rtn: return follows the service date
-                r["ret"] = r["disposal"] or r["loaded"] or r["request"]
+            elif r["ret"] is None:  # S/Repo -> S/Rtn: return follows the loaded date
+                r["ret"] = r["loaded"] or r["disposal"] or r["request"]
+                if r["ret"] is not None:
+                    r["auto"].add("ret")
         return
     if col == COL_BIN:
         r["bin"] = s or "Unknown"
@@ -1133,6 +1275,7 @@ def apply_cell_edit(r, col, val, ref):
     r["err"].pop(col, None)
     r["raw"].pop(col, None)
     field = _DATE_FIELD[col]
+    r["auto"].discard(field)  # typed (or cleared) by the user: no longer auto-filled
     if s == "":
         r[field] = None
         return
@@ -1142,6 +1285,7 @@ def apply_cell_edit(r, col, val, ref):
             r["disposal"] = d
             if l is not None:
                 r["loaded"] = l  # "9/1 (8/30)": the part in brackets is the loaded date
+                r["auto"].discard("loaded")
         else:
             r[field] = parse_date_text(s, r["disposal"] or r["loaded"] or r["request"] or ref)
     except ValueError as ex:
@@ -1150,7 +1294,8 @@ def apply_cell_edit(r, col, val, ref):
 
 
 def edit_row(r, edits, ref):
-    """Apply a batch of (column, value) edits to one row, then pre-fill if it was empty.
+    """Apply a batch of (column, value) edits to one row, then pre-fill if it was empty
+    and let previously pre-filled cells follow the change.
 
     An empty row, or an untouched demo row, is treated as new: the first date entered
     replaces whatever the other date cells held, so pasting a column of dates over the
@@ -1162,12 +1307,14 @@ def edit_row(r, edits, ref):
         for f in DATE_FIELDS:
             r[f] = None
         r["err"], r["raw"] = {}, {}
+        r["auto"] = set()
     for col, val in edits:
         apply_cell_edit(r, col, val, ref)
     if touched:
         r["ph"] = False
     if entered and fresh:
         seed_row(r)
+    refresh_auto(r)  # auto-filled cells follow whatever the user just changed
 
 
 def _cell_txt(r, col, field):
@@ -1828,9 +1975,11 @@ def render_table_mode(num_bins):
         "part in brackets fills **Loaded date**. **Ctrl+Enter** runs Calculate."
     )
     st.caption(
-        "🔄 Entering the first date in an empty row pre-fills that row's other blank dates; "
-        "after that nothing is ever overwritten by editing a different cell. Only the date for "
-        "the billing basis (sidebar) is required — clear any cell you don't need."
+        "🔄 Entering the first date in an empty row pre-fills that row's other blank dates. "
+        "Pre-filled cells follow if you change a date you typed; a cell you typed yourself is never "
+        "overwritten. A blank **Return** means the bin was on site again from the **Loaded** date "
+        "(a swap) — type a later Return date if it really was off site. Only the date for the "
+        "billing basis (sidebar) is required — clear any cell you don't need."
     )
 
     def _editor():
@@ -1855,8 +2004,9 @@ def render_table_mode(num_bins):
                                   help="Date the bin was dumped (the roll-off log date). "
                                        "Accepts 9/1, 1-Oct, 2026-09-01, 260901 or 9/1 (8/30)."),
                 COL_RETURN: _cc("TextColumn", COL_RETURN,
-                                help="Date the bin was back on site (starts the next cycle). "
-                                     "May be later than Disposal. Blank for S/Repo."),
+                                help="Date the bin was back on site (starts the next cycle). Blank = the "
+                                     "Loaded date (empty bin left on site, e.g. a swap). Enter a later "
+                                     "date if the bin was off site. Blank for S/Repo."),
                 COL_BIN: _cc("SelectboxColumn", COL_BIN,
                              help="Lock event to a specific bin, or leave Unknown",
                              options=bin_options, required=True, default="Unknown"),
@@ -1915,7 +2065,8 @@ def render_picker_mode(num_bins):
             if r["type"] == "S/Rtn":
                 st.date_input("Return date", key=k("ret"), on_change=on_picker_change,
                               args=(uid, "ret", v),
-                              help="Date the bin was back on site. May be later than Disposal.", **dkw)
+                              help="Date the bin was back on site. Blank = Loaded date (swap). "
+                                   "May be later than Disposal.", **dkw)
             else:
                 st.markdown("_(rental ends — no return date)_")
         with c[5]:
@@ -1928,6 +2079,12 @@ def render_picker_mode(num_bins):
 
 def events_panel(num_bins, end_basis):
     st.subheader("Events")
+    ub = st.columns([1, 1, 6])
+    ub[0].button("↶ Undo", key="undo_btn", on_click=undo_cb, disabled=not S.get("undo"),
+                 help=f"Undo the last change to the events ({len(S.get('undo', []))} step(s) available).",
+                 **STRETCH)
+    ub[1].button("↷ Redo", key="redo_btn", on_click=redo_cb, disabled=not S.get("redo"),
+                 help=f"Redo ({len(S.get('redo', []))} step(s) available).", **STRETCH)
     st.caption("**S/Rtn** = Service & return (bin comes back) | **S/Repo** = Service & repo (rental ends)")
     mode = st.radio(
         "Input mode", [TABLE_MODE, PICKER_MODE], horizontal=True, key="input_mode",
@@ -1939,11 +2096,11 @@ def events_panel(num_bins, end_basis):
     if S["rows_default"] and S.get("rows_anchor") != anchor:
         S["rows"] = default_rows(anchor)
         S["rows_anchor"] = anchor
-        touch("other")
+        touch("other", record=False)
     notices = sanitize_rows(S["rows"], int(num_bins))
     if notices:
         S["_flash_notices"] = S.get("_flash_notices", []) + notices
-        touch("other")
+        touch("other", record=False)
 
     if mode == TABLE_MODE:
         render_table_mode(num_bins)
@@ -2192,10 +2349,14 @@ def init_state():
     d("version_name", "")
     d("staggered", False)
     d("input_mode", TABLE_MODE)
+    d("undo", [])
+    d("redo", [])
     if "rows" not in S:
         S["rows"] = default_rows(_anchor())
         S["rows_default"] = True
         S["rows_anchor"] = _anchor()
+    if S.get("_last_snap") is None:
+        S["_last_snap"] = state_snap()
 
 
 def inject_css():
@@ -2234,7 +2395,101 @@ def inject_css():
     )
 
 
+# ──────────────────────────────────────────────
+# Browser backup: saved runs + working events + undo/redo history are mirrored into this
+# browser's localStorage, so they come back after the server hibernates or restarts (its
+# disk may be wiped), the device is powered off, or the page is reloaded.
+# ──────────────────────────────────────────────
+_STORE_HTML = """<!doctype html><html><body><script>
+(function () {
+  var KH = "bin_calc_history_v1", KW = "bin_calc_work_v1", reported = false;
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data || {}), "*");
+  }
+  function get(k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } }
+  function put(k, v) { try { window.localStorage.setItem(k, v); } catch (e) {} }
+  window.addEventListener("message", function (ev) {
+    var m = ev.data || {};
+    if (m.type !== "streamlit:render") return;
+    var a = m.args || {};
+    if (typeof a.hist === "string") put(KH, a.hist);
+    if (typeof a.work === "string") put(KW, a.work);
+    if (!reported) {
+      reported = true;
+      post("streamlit:setComponentValue", {value: {ok: true, hist: get(KH), work: get(KW)}, dataType: "json"});
+    }
+  });
+  post("streamlit:componentReady", {apiVersion: 1});
+  post("streamlit:setFrameHeight", {height: 0});
+})();
+</script></body></html>"""
+
+
+@st.cache_resource
+def _store_component():
+    d = os.path.join(tempfile.gettempdir(), "bin_calc_store")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "index.html"), "w") as f:
+        f.write(_STORE_HTML)
+    return components.declare_component("bin_calc_store", path=d)
+
+
+def restore_from_browser():
+    """Once per session, as soon as the browser has reported what it holds."""
+    blob = S.get("bin_store")
+    if S.get("_browser_ready") or not isinstance(blob, dict):
+        return
+    S["_browser_ready"] = True
+    notes = []
+    try:  # saved runs: only when the server's own file came back empty
+        hist = json.loads(blob.get("hist") or "null")
+        if isinstance(hist, list) and hist and not load_history():
+            save_history(hist)
+            notes.append(f"Restored {len(hist)} saved run(s) from this device's backup copy "
+                         "(the server's history file was empty).")
+    except Exception:
+        pass
+    try:  # working events + undo/redo, only into an untouched session
+        w = json.loads(blob.get("work") or "null")
+        if (isinstance(w, dict) and w.get("rows") and S.get("rows_default")
+                and not S.get("undo") and not S.get("redo") and not S.get("last_results")):
+            def _ok(lst):
+                return [x for x in (lst or []) if isinstance(x, dict) and isinstance(x.get("rows"), list)]
+            S["rows"] = [_row_from_snap(x) for x in w["rows"]]
+            S["rows_default"] = bool(w.get("default", False))
+            S["undo"] = _ok(w.get("undo"))[-MAX_UNDO:]
+            S["redo"] = _ok(w.get("redo"))[-MAX_UNDO:]
+            S["_uid"] = max([S.get("_uid", 0)] + [r["uid"] for r in S["rows"]])
+            touch("other", record=False)
+            if not S["rows_default"]:
+                notes.append("Restored your last events and undo history. Use **Reset events** to start fresh.")
+    except Exception:
+        pass
+    if notes:
+        S["_flash_notices"] = S.get("_flash_notices", []) + notes
+
+
+def persist_to_browser():
+    """Mount the (invisible) store; once it has reported, keep it up to date."""
+    args = {}
+    if S.get("_browser_ready"):
+        args["work"] = json.dumps({
+            "rows": state_snap()["rows"], "default": bool(S.get("rows_default")),
+            "undo": S.get("undo", [])[-MAX_UNDO_SAVED:], "redo": S.get("redo", [])[-MAX_UNDO_SAVED:],
+            "saved": now_guam().isoformat(timespec="seconds"),
+        }, separators=(",", ":"))
+        sig = _history_sig()
+        if sig != S.get("_hist_sig_sent"):
+            args["hist"] = json.dumps(load_history(), default=str, separators=(",", ":"))
+            S["_hist_sig_sent"] = sig
+    try:
+        _store_component()(key="bin_store", default=None, **args)
+    except Exception:
+        pass  # the backup is a safety net; never break the app for it
+
+
 init_state()
+restore_from_browser()
 inject_css()
 
 with st.container(key="app_header"):
@@ -2437,10 +2692,75 @@ if page == NAV_CALC:
     results_panel(show_tree, show_days, show_timeline, interchangeable,
                   hide_invalid_leaves, end_basis, filters)
 
-    # Ctrl+Enter shortcut
+    # Ctrl+Enter shortcut, plus: keep the table's scroll position when it is re-drawn
     components.html(
         """
         <script>
+        (function() {
+            const doc = window.parent.document;
+            if (doc._gridScrollKeeper) return;
+            doc._gridScrollKeeper = true;
+            // Editing a date can re-seed the table, which makes Streamlit draw a fresh grid
+            // that starts at the top-left. Remember the offsets and put them back.
+            const saved = {gl: 0, gt: 0, pl: 0, pt: 0};
+            let frozen = false, tracked = null, token = 0, queued = false;
+            const grid = () => {
+                const g = doc.querySelector('[data-testid="stDataFrame"]');
+                return g ? g.querySelector('.dvn-scroller') : null;
+            };
+            const main = () => doc.querySelector('[data-testid="stMain"]')
+                || doc.querySelector('section.main')
+                || doc.querySelector('[data-testid="stAppViewContainer"]');
+            doc.addEventListener('scroll', function(e) {
+                if (frozen) return;
+                const t = e.target;
+                if (!t || t === doc || !t.classList) return;
+                if (t.classList.contains('dvn-scroller')) {
+                    if (t === grid()) { saved.gl = t.scrollLeft; saved.gt = t.scrollTop; tracked = t; }
+                } else if (t === main()) {
+                    saved.pl = t.scrollLeft; saved.pt = t.scrollTop;
+                }
+            }, true);
+            const userEvents = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+            function restore() {
+                frozen = true;
+                const my = ++token, t0 = Date.now();
+                let stable = 0;
+                function finish() {
+                    userEvents.forEach(ev => doc.removeEventListener(ev, takeOver, true));
+                    if (token === my) { frozen = false; tracked = grid(); }
+                }
+                function takeOver() { token++; finish(); frozen = false; tracked = grid(); }
+                userEvents.forEach(ev => doc.addEventListener(ev, takeOver, {capture: true, passive: true}));
+                (function step() {
+                    if (token !== my) return;
+                    const g = grid();
+                    if (g) {
+                        if (Math.abs(g.scrollLeft - saved.gl) > 1) g.scrollLeft = saved.gl;
+                        if (Math.abs(g.scrollTop - saved.gt) > 1) g.scrollTop = saved.gt;
+                        const m = main();
+                        if (m) {
+                            if (Math.abs(m.scrollTop - saved.pt) > 1) m.scrollTop = saved.pt;
+                            if (Math.abs(m.scrollLeft - saved.pl) > 1) m.scrollLeft = saved.pl;
+                        }
+                        const ok = Math.abs(g.scrollLeft - saved.gl) <= 1 && Math.abs(g.scrollTop - saved.gt) <= 1;
+                        stable = ok ? stable + 1 : 0;
+                        if (stable >= 15) return finish();
+                    }
+                    if (Date.now() - t0 > 2500) return finish();  // no grid came back (other page): leave alone
+                    requestAnimationFrame(step);
+                })();
+            }
+            new MutationObserver(function() {
+                if (queued || frozen) return;
+                queued = true;
+                requestAnimationFrame(function() {
+                    queued = false;
+                    if (tracked && !tracked.isConnected) restore();
+                    else if (!tracked) tracked = grid();
+                });
+            }).observe(doc.body, {childList: true, subtree: true});
+        })();
         (function() {
             const doc = window.parent.document;
             if (doc._ctrlEnterAttached) return;
@@ -2467,3 +2787,6 @@ else:
     # Page: History
     # ──────────────────────────────────────────
     render_history(show_days)
+
+# Keep the browser backup current (runs on every page, after everything else).
+persist_to_browser()
