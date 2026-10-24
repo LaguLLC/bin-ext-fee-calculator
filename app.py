@@ -1,3 +1,4 @@
+import difflib
 import hashlib
 import inspect
 import json
@@ -6,6 +7,7 @@ import re
 import shutil
 import tempfile
 import threading
+import unicodedata
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from itertools import product
@@ -67,14 +69,10 @@ WAIVE_MODES = {
     "skip_days": "Waived days don't count toward the cycle (free days run on working days)",
 }
 
-# How two dates in one work order must relate. These only decide what the table accepts (they never
-# change the maths), so they are NOT part of the saved run options.
-DATE_RULE_LABELS = {
-    "ge": "same day or later (≥)",
-    "gt": "strictly later (>)",
-    "eq": "the same day (=)",
-    "any": "no rule",
-}
+# How two dates in one work order must relate. Only what is ALWAYS true is enforced (the same day is fine):
+# Request <= Loaded <= Disposal, and a Return is never before the Request. There is deliberately no setting
+# for stricter, batch-specific rules. The one choice the user has is whether an S/Rtn may return before it
+# is loaded (S/Swap always may): the "dr_rtn_early" checkbox. These never change the maths.
 DATE_RULES_DEFAULT = {"req_load": "ge", "load_disp": "ge", "req_ret": "ge", "load_ret": "ge", "disp_ret": "any"}
 _RULE_WORD = {"ge": "on or after", "gt": "after", "eq": "the same day as"}
 
@@ -651,9 +649,72 @@ def is_valid_assignment(events, assignment, delivery_dates, distinct_links=False
 
 
 # ---- Photo IDs, auto-assignment, dry runs: everything that prepares events for the maths ----
+_ID_FILLER = {"the", "a", "an", "of", "on", "in", "at", "with", "and", "bin", "no", "number", "num", "nr", "id"}
+_ID_UNKNOWN = {"unknown", "unk", "na", "none", "nil", "tbd", "tba", "unsure", "idk", "dunno", "notsure"}
+
+
 def _norm_link(s):
-    s = re.sub(r"\s+", " ", str(s or "").strip()).casefold()
-    return s
+    """Matching key for a Photo ID. Two IDs match when they only differ in capitals, accents, punctuation,
+    spacing, filler words (the / a / on / bin / no / #), a trailing plural 's' or leading zeros, e.g.
+    'Smudge on door' = 'the smudge on the door!' = 'smudge-on  doors'; 'Bin B-012' = 'b12' = '#B 12'.
+    Placeholders such as '?', 'unknown', 'n/a' mean 'not known' and count as blank. It does NOT guess at
+    misspellings (that could tie two different bins) — look-alike IDs are flagged instead (photo_id_report)."""
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch)).casefold().replace("&", " and ")
+    s = re.sub(r"[\W_]+", " ", s)
+    if "".join(s.split()) in _ID_UNKNOWN:          # '?', 'n/a', 'not sure' ...
+        return ""
+    toks = []
+    for t in s.split():
+        if t in _ID_FILLER:
+            continue
+        if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+            t = t[:-1]
+        toks.append(re.sub(r"(?<!\d)0+(?=\d)", "", t))
+    return "".join(toks)
+
+
+def photo_id_report(rows):
+    """For the Photo ID columns of the table rows. -> (slots, lookalikes)
+    slots = [{"key": ..., "rows": [row numbers], "written": [raw texts]}] for work orders tied together
+    (or using the same ID more than once); lookalikes = [(raw_a, raw_b)] IDs that are NOT matched but are
+    suspiciously similar (a likely typo)."""
+    keys_per_row, raw_of = [], {}
+    for r in rows:
+        ks = []
+        for fld, ok in (("link", True), ("link2", r.get("type") == "S/Swap")):
+            raw = (r.get(fld) or "").strip()
+            k = _norm_link(raw) if (ok and raw) else ""
+            ks.append(k)
+            if k:
+                raw_of.setdefault(k, []).append(raw)
+        keys_per_row.append(ks)
+    comp = union_groups(keys_per_row)
+    slots = {}
+    for i, (c, ks) in enumerate(zip(comp, keys_per_row), 1):
+        if c:
+            d = slots.setdefault(c, {"key": c, "rows": [], "written": []})
+            d["rows"].append(i)
+            for k in ks:
+                for w in raw_of.get(k, []):
+                    if w not in d["written"]:
+                        d["written"].append(w)
+    slot_list = [d for d in slots.values() if len(d["rows"]) > 1 or len(set(_norm_link(w) for w in d["written"])) > 1]
+    keys = sorted(raw_of)
+    comp_of = {}
+    for ks, c in zip(keys_per_row, comp):
+        for k in ks:
+            if k:
+                comp_of[k] = c
+    looks = []
+    for ai in range(len(keys)):
+        for bi in range(ai + 1, len(keys)):
+            a, b = keys[ai], keys[bi]
+            if comp_of.get(a) == comp_of.get(b) or min(len(a), len(b)) < 4:
+                continue
+            if difflib.SequenceMatcher(None, a, b).ratio() >= 0.82:
+                looks.append((raw_of[a][0], raw_of[b][0]))
+    return slot_list, looks
 
 
 def union_groups(id_lists):
@@ -1480,6 +1541,7 @@ COL_PHOTO2 = "Photo ID (dropped)"
 COL_BASIS = "Fee basis"
 COL_WASTE = "Waste type"
 COL_REMARKS = "Remarks"
+COL_DISP_PIN = "Disposal (frozen)"   # read-only copy of Disposal date, pinned at the left (see build_view_df)
 # Chronological left to right; Type first because it decides whether Return exists.
 # TBL_COLS is every column the table holds. Which ones are SHOWN, and in what order, is
 # decided by visible_cols(); a hidden column keeps its data (it is only left out of column_order).
@@ -1689,7 +1751,7 @@ def sanitize_rows(rows, num_bins):
 
 
 def current_rules():
-    return {k: S.get(f"dr_{k}", v) for k, v in DATE_RULES_DEFAULT.items()}
+    return dict(DATE_RULES_DEFAULT)
 
 
 def _rule_ok(rule, earlier, later):
@@ -2028,7 +2090,7 @@ def possible_bin_texts(rows):
 def build_view_df(rows):
     def col(values):
         return pd.Series(values, dtype=object)
-    return pd.DataFrame({
+    df = pd.DataFrame({
         COL_NO: col([str(i) for i in range(1, len(rows) + 1)]),
         COL_TYPE: col([r["type"] for r in rows]),
         COL_REQUEST: col([_cell_txt(r, COL_REQUEST, "request") for r in rows]),
@@ -2044,12 +2106,16 @@ def build_view_df(rows):
         COL_WASTE: col([r.get("waste", "") for r in rows]),
         COL_REMARKS: col([r.get("remarks", "") for r in rows]),
     })[TBL_COLS]
+    df[COL_DISP_PIN] = df[COL_DISPOSAL]          # display-only copy (never read back into the rows)
+    return df
 
 
 def _same_view(a, b):
     if len(a) != len(b):
         return False
-    for c in TBL_COLS:
+    for c in TBL_COLS + [COL_DISP_PIN]:
+        if c not in a.columns or c not in b.columns:
+            continue
         for x, y in zip(a[c].tolist(), b[c].tolist()):
             if _norm_cell(x) != _norm_cell(y):
                 return False
@@ -2194,13 +2260,22 @@ def visible_cols():
         hidden.add(COL_POSS)
     order = [c for c in S.get("col_order", TBL_COLS) if c in TBL_COLS and c != COL_NO]
     order += [c for c in TBL_COLS if c != COL_NO and c not in order]
-    return [COL_NO] + [c for c in order if c not in hidden]
+    head = [COL_NO] + ([COL_DISP_PIN] if S.get("pin_disp_copy", True) else [])
+    return head + [c for c in order if c not in hidden]
+
+
+def data_cols():
+    """The real, reorderable data columns (not the row number, not the frozen copy)."""
+    return [c for c in visible_cols() if c not in (COL_NO, COL_DISP_PIN)]
 
 
 def frozen_cols():
-    """Columns pinned on the left (Streamlit moves pinned columns to the left, in this order)."""
+    """Columns pinned on the left. Streamlit always moves pinned columns to the left, in this order. The frozen
+    copy of Disposal date (if on) is pinned so the REAL Disposal column keeps its place among the others."""
     vis = visible_cols()
-    return [c for c in vis if c in (S.get("freeze_cols") or [])]
+    pins = S.get("pin_cols")
+    pins = [COL_NO] if pins is None else pins
+    return [c for c in vis if c in pins or c == COL_DISP_PIN]
 
 
 def set_opts_widgets(o):
@@ -2272,6 +2347,27 @@ def sort_rows_cb():
     touch("other")
 
 
+def clear_column_cb():
+    """Blank one column for every row (dates -> empty, Bin -> Unknown, text -> empty). Undoable."""
+    col = S.get("clr_col")
+    rows = S["rows"]
+    if col not in EDIT_COLS or col == COL_TYPE or not rows:
+        return
+    for pos, r in enumerate(rows):
+        edit_row(r, [(col, "")], _ref_for_row(rows, pos))
+    S["rows_default"] = False
+    touch("other")
+
+
+def delete_row_cb():
+    rows = S["rows"]
+    if not rows:
+        return
+    del rows[min(max(int(S.get("ins_pos", 1)), 1), len(rows)) - 1]
+    S["rows_default"] = False
+    touch("other")
+
+
 def insert_rows_cb(where):
     """Insert blank rows above / below row # (1-based) instead of only at the end."""
     rows = S["rows"]
@@ -2299,7 +2395,7 @@ def move_row_cb():
 
 def apply_col_order(ids):
     cur = [c for c in S.get("col_order", TBL_COLS) if c != COL_NO]
-    vis = [c for c in visible_cols() if c != COL_NO]
+    vis = data_cols()
     if sorted(ids) != sorted(vis) or list(ids) == [c for c in cur if c in vis]:
         return False
     # keep hidden columns where they were; re-slot the visible ones in the dragged order
@@ -2534,6 +2630,23 @@ def fmt_range(lo, hi, dlo=None, dhi=None, show_days=True):
 # ──────────────────────────────────────────────
 # Rendering helpers: scenario table
 # ──────────────────────────────────────────────
+def _bin_pin_plan(text_len, budget=330, no_w=50):
+    """-> {bin number: pixel width} for the Bin columns that can be frozen. Streamlit's grid stops freezing
+    (and shows a blank strip) when the frozen columns take up more than about half of the table's width, so
+    only as many Bin columns as fit in a modest budget are frozen, each as wide as its text up to a cap
+    (longer text is cut off with an ellipsis; drag the column edge to widen it)."""
+    plan, used = {}, no_w
+    for b in sorted(text_len):
+        need = int(min(max(text_len[b] * 6.3 + 14, 70), 170))
+        if used + need > budget:
+            break
+        plan[b] = need
+        used += need
+    if not plan and text_len:                      # one very wide Bin column: still freeze the first, narrower
+        plan[sorted(text_len)[0]] = max(70, budget - no_w - 20)
+    return plan
+
+
 def build_scenario_table(results, num_bins, show_days, show_cal=False):
     """Numeric columns (so sorting by Total puts $250 before $300 before $3,000)
     plus the column_config that formats them."""
@@ -2559,8 +2672,11 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False):
                 row["Weekend/holiday Days"] = int(r.get("cal_waived_days", 0))
         rows.append(row)
     cfg = {"No": _cc("TextColumn", "No", align="center", width="small", pinned=True)}
+    pin_plan = _bin_pin_plan({b: max([len(r_[f"Bin {b}"]) for r_ in rows] or [6]) for b in range(1, nb + 1)}) \
+        if S.get("pin_bins", True) else {}
     for b in range(1, nb + 1):
-        cfg[f"Bin {b}"] = _cc("TextColumn", f"Bin {b}", width="medium")
+        w_pin = pin_plan.get(b)      # frozen Bin columns get an explicit, modest width (see _bin_pin_plan)
+        cfg[f"Bin {b}"] = _cc("TextColumn", f"Bin {b}", **({"width": w_pin, "pinned": True} if w_pin else {"width": "medium"}))
         cfg[f"Bin {b} Fee"] = _cc("NumberColumn", f"Bin {b} Fee", format=DOLLAR, width="small")
         if show_days:
             cfg[f"Bin {b} Days"] = _cc("NumberColumn", f"Bin {b} Days", format="%d d", width="small")
@@ -2749,7 +2865,8 @@ def render_results(cached, filters, show_tree, show_days, show_timeline, interch
     m1.metric("Lowest total fee", fmt_fee(lowest, lowest_ext, show_days))
     m2.metric("Highest total fee", fmt_fee(highest, highest_ext, show_days))
     m3.metric("Range", f"${highest - lowest:,.0f}")
-    m4.metric("Waived (min – max)", fmt_range(min(w_vals), max(w_vals), min(wd_vals), max(wd_vals), show_days))
+    m4.metric("Waived (min – max)",
+              fmt_range(min(w_vals), max(w_vals), min(wd_vals), max(wd_vals), show_days).replace("$", "\\$"))
 
     show_scenario_table(results, num_bins, show_days, cal is not None)
 
@@ -3093,29 +3210,27 @@ def calendar_df(df):
     return out
 
 
+def table_tips():
+    st.info(
+        "💡 **Paste from Excel** (rows are added). **Delete** clears the selected cells — tick a row's checkbox "
+        "first to delete the row. Dates: `261027`, `10/27/26`, `Oct 27`, `1027`… (no year = this year); "
+        "`9/1 (8/30)` also fills Loaded. **Ctrl+Enter** calculates · **Ctrl+Z / Y** undo / redo."
+    )
+    with st.expander("How blank dates are filled"):
+        st.write(
+            "The first date typed in an empty row pre-fills that row's other blank dates; those follow if you "
+            "change a date you typed, and a cell you typed yourself is never overwritten. A blank **Return** means "
+            "the bin was back on site from the **Loaded** date. An S/Swap (or an S/Rtn, if the sidebar allows it) "
+            "may have an earlier Return — never before the Request date. Only the date for the billing basis is "
+            "required; clear any cell you don't need.")
+
+
 def render_table_mode(num_bins):
     ensure_table_fresh()
     bin_options = ["Unknown"] + [f"Bin {b + 1}" for b in range(int(num_bins))]
     type_options = list(TYPE_DISPLAY.keys())
     cal = S.get("date_cells") == "calendar"
     pins = set(frozen_cols())
-
-    st.info(
-        "💡 **Table tips:** paste a block of dates straight from Excel — rows are added "
-        "automatically. **Delete** clears the selected cell(s); with a row's checkbox ticked "
-        "(it shows when you hover at the left of a row; the one in the header selects all) it "
-        "deletes the row(s) instead. Dates can be typed in almost any form — "
-        "`261027`, `20261027`, `2026-1027`, `10/27/2026`, `Oct 27`, `27-Oct`, `1027` — a missing year "
-        "means the current year; the log style `9/1 (8/30)` fills **Loaded date** from the part in brackets. "
-        "**Ctrl+Enter** runs Calculate, **Ctrl+Z / Ctrl+Y** undo / redo."
-    )
-    st.caption(
-        "🔄 Entering the first date in an empty row pre-fills that row's other blank dates. "
-        "Pre-filled cells follow if you change a date you typed; a cell you typed yourself is never "
-        "overwritten. A blank **Return** means the bin was on site again from the **Loaded** date. "
-        "An S/Swap (or an S/Rtn when the sidebar allows it) may have an earlier Return — never before the "
-        "Request date. Only the date for the billing basis (sidebar) is required — clear any cell you don't need."
-    )
 
     def cfg_for(col, kind, label=None, **kw):
         return _cc(kind, label or col, pinned=(col in pins), **kw)
@@ -3134,9 +3249,13 @@ def render_table_mode(num_bins):
             hide_index=True,
             height=tbl_height(len(S["rows"])),
             column_order=visible_cols(),
-            disabled=[COL_NO, COL_POSS],
+            disabled=[COL_NO, COL_POSS, COL_DISP_PIN],
             column_config={
                 COL_NO: _cc("TextColumn", "No", align="center", width="small", pinned=(COL_NO in pins)),
+                COL_DISP_PIN: _cc("TextColumn", COL_DISP_PIN, width=125, pinned=True,
+                                  help="Read-only copy of Disposal date, frozen at the left so it stays visible when "
+                                       "you scroll right. Edit the real Disposal date column. Switch off under "
+                                       "Table settings."),
                 COL_TYPE: cfg_for(COL_TYPE, "SelectboxColumn",
                                   help="S/Rtn = service & return (bin comes back) · S/Repo = rental ends (no return "
                                        "date) · S/Swap = empty bin dropped, full bin loaded · Dry run = truck went, "
@@ -3311,7 +3430,7 @@ def row_toolbar(mode):
     n = len(S["rows"])
     for _k, _hi in (("ins_pos", max(n, 1)), ("mv_from", max(n, 1)), ("mv_to", max(n, 1)), ("ins_n", 20)):
         S[_k] = min(max(int(S.get(_k, 1)), 1), _hi)      # keep the stored value inside the current range
-    cols = visible_cols()
+    cols = [c for c in visible_cols() if c != COL_DISP_PIN]
     if S.get("sort_col") not in cols:
         S["sort_col"] = COL_REQUEST if COL_REQUEST in cols else cols[0]
     c = st.columns([2.2, 1.4, 0.9, 1.3, 1.1, 1.35, 1.35], vertical_alignment="bottom")
@@ -3320,10 +3439,21 @@ def row_toolbar(mode):
                         "click-to-sort on a table that lets you add rows, so sorting lives here.")
     c[1].selectbox("Order", ["Ascending", "Descending"], key="sort_dir")
     c[2].button("↕ Sort", key="sort_go", on_click=sort_rows_cb, disabled=n < 2, **STRETCH)
-    c[3].number_input("Insert at row #", min_value=1, max_value=max(n, 1), key="ins_pos")
-    c[4].number_input("How many", min_value=1, max_value=20, key="ins_n")
+    c[3].number_input("Row #", min_value=1, max_value=max(n, 1), key="ins_pos",
+                      help="The row used by Insert above / Insert below / Delete row.")
+    c[4].number_input("Insert how many", min_value=1, max_value=20, key="ins_n")
     c[5].button("⬆ Insert above", key="ins_above", on_click=insert_rows_cb, args=("above",), **STRETCH)
     c[6].button("⬇ Insert below", key="ins_below", on_click=insert_rows_cb, args=("below",), **STRETCH)
+    clr_opts = [c_ for c_ in data_cols() if c_ in EDIT_COLS and c_ != COL_TYPE]
+    if S.get("clr_col") not in clr_opts:
+        S["clr_col"] = clr_opts[0]
+    d = st.columns([2.2, 1.4, 0.9, 1.3, 1.1, 1.35, 1.35], vertical_alignment="bottom")
+    d[0].selectbox("Clear a whole column", clr_opts, key="clr_col",
+                   help="Empties this column in every row (undoable). To clear just some cells, select them in the "
+                        "table (click, then Shift+click or drag) and press Delete.")
+    d[1].button("🧹 Clear column", key="clr_go", on_click=clear_column_cb, disabled=n < 1, **STRETCH)
+    d[3].button("🗑 Delete row", key="del_row_go", on_click=delete_row_cb, disabled=n < 1,
+                help="Deletes the row number shown in Row #.", **STRETCH)
     with st.expander("↔ More: move a row, drag rows and columns"):
         mc = st.columns([1, 1, 1, 1], vertical_alignment="bottom")
         mc[0].number_input("Move row #", min_value=1, max_value=max(n, 1), key="mv_from")
@@ -3336,10 +3466,25 @@ def row_toolbar(mode):
                         apply_row_order, max_height=230)
         if mode == TABLE_MODE:
             st.markdown("**Drag columns** into a new order (switch columns on/off under *Table settings* in the sidebar)")
-            drag_sorter("col_sorter", [{"id": c_, "label": c_} for c_ in visible_cols() if c_ != COL_NO],
+            drag_sorter("col_sorter", [{"id": c_, "label": c_} for c_ in data_cols()],
                         apply_col_order, horizontal=True, max_height=90)
         st.caption("You can also drag a column header in the table itself, but that only lasts until the "
                    "table is next re-drawn — use the list above to keep the order.")
+
+
+def show_photo_report(rows):
+    """What the Photo ID matching did, and any IDs that look like typos of each other."""
+    slots, looks = photo_id_report(rows)
+    for a_, b_ in looks:
+        st.warning(f"Photo IDs “{a_}” and “{b_}” look alike but are treated as DIFFERENT bins. "
+                   "If they are the same bin, retype one so they match.")
+    if slots:
+        with st.expander(f"🔎 Photo IDs: {len(slots)} group(s) of work orders tied to one bin"):
+            st.dataframe(pd.DataFrame([{"Rows tied together": ", ".join(map(str, d["rows"])),
+                                        "Written as": " | ".join(d["written"])} for d in slots]),
+                         hide_index=True, **STRETCH)
+            st.caption("IDs match ignoring capitals, accents, punctuation, spacing, filler words (the, a, on, bin, "
+                       "no, #), a trailing plural “s” and leading zeros. “?”, “unknown”, “n/a” count as blank.")
 
 
 def events_panel(num_bins, end_basis):
@@ -3362,7 +3507,9 @@ def events_panel(num_bins, end_basis):
         S["_flash_notices"] = S.get("_flash_notices", []) + notices
         touch("other", record=False)
 
-    row_toolbar(mode)   # before the table, so a reorder is already in SSOT when the grid is drawn
+    if mode == TABLE_MODE:
+        table_tips()
+    row_toolbar(mode)   # right above the table, and before it, so a reorder is already in SSOT when the grid is drawn
     if mode == TABLE_MODE:
         render_table_mode(num_bins)
     else:
@@ -3376,6 +3523,8 @@ def events_panel(num_bins, end_basis):
         st.error("⚠️ Fix before calculating:\n\n" + "\n".join(f"- {e}" for e in errors))
     for w in warns:
         st.warning(w)
+    if current_opts()["photo_on"]:
+        show_photo_report(S["rows"])
     pool = [effective_dates(r) for r in S["rows"] if any(r[f] for f in DATE_FIELDS)]
     key = {"request": "request", "loaded": "loaded"}.get(end_basis, "disposal")
     st.caption(
@@ -3676,10 +3825,10 @@ def init_state():
                  ("opt_weekend_days", [5, 6]), ("opt_hol_on", False), ("opt_hol_names", list(HOLIDAY_DEFAULT)),
                  ("opt_hol_observed", True), ("opt_extra_hol", []),
                  ("opt_waive_mode", DEFAULT_OPTS["waive_mode"]),
-                 ("dr_rtn_early", False), ("dr_req_load", "ge"), ("dr_load_disp", "ge"), ("dr_req_ret", "ge"),
-                 ("dr_load_ret", "ge"), ("dr_disp_ret", "any"),
+                 ("dr_rtn_early", False),
                  ("col_waste", True), ("col_remarks", True), ("col_poss", True), ("col_paid", False),
-                 ("date_cells", "text"), ("year_rule", "current"), ("freeze_cols", [COL_NO, COL_DISPOSAL]),
+                 ("date_cells", "text"), ("year_rule", "current"), ("pin_cols", [COL_NO]), ("pin_disp_copy", True),
+                 ("pin_bins", True), ("pin_sidebar", False), ("clr_col", COL_REQUEST),
                  ("sort_dir", "Ascending")):
         d(k, v)
     d("col_order", [c for c in TBL_COLS if c != COL_NO])
@@ -3708,6 +3857,11 @@ def inject_css():
         }}
         .st-key-app_header {{
             padding: .25rem 0 .35rem 0; gap: .35rem; border-bottom: 1px solid {edge};
+        }}
+        /* long metric values wrap instead of being cut off with an ellipsis */
+        [data-testid="stMetricValue"], [data-testid="stMetricValue"] > div {{
+            overflow: visible !important; text-overflow: clip !important; white-space: normal !important;
+            overflow-wrap: anywhere;
         }}
         .st-key-app_header .app-title {{ font-size: 1.7rem; font-weight: 700; line-height: 1.35; padding-bottom: .35rem; }}
         /* the invisible helper iframe (shortcuts, scroll keeper) takes no room */
@@ -3763,6 +3917,38 @@ _HELPER_HTML = """<script>
     e.preventDefault();
     if (!btn.disabled) btn.click();
   }, true);
+
+  // ---- pinned sidebar: stay open, and move the page over by however much the sidebar covers it ----
+  var PIN = "__PIN__" === "1";
+  var pstyle = doc.getElementById('bin-pin-style');
+  if (pstyle) pstyle.remove();
+  if (PIN) {
+    pstyle = doc.createElement('style'); pstyle.id = 'bin-pin-style';
+    pstyle.textContent = '[data-testid="stSidebarCollapseButton"]{display:none !important;}' +
+      '[data-testid="stMain"]{margin-left:var(--bin-pin-shift,0px) !important;' +
+      'width:calc(100% - var(--bin-pin-shift,0px)) !important;min-width:0 !important;}';
+    doc.head.appendChild(pstyle);
+    var fitPin = function () {
+      var sb = doc.querySelector('[data-testid="stSidebar"]'), mn = doc.querySelector('[data-testid="stMain"]');
+      if (!sb || !mn) return;
+      if (sb.getAttribute('aria-expanded') === 'false') {
+        var ex = doc.querySelector('[data-testid="stExpandSidebarButton"]');
+        if (ex) ex.click();
+        return;
+      }
+      doc.documentElement.style.setProperty('--bin-pin-shift', '0px');
+      var shift = Math.max(0, Math.round(sb.getBoundingClientRect().right - mn.getBoundingClientRect().left));
+      doc.documentElement.style.setProperty('--bin-pin-shift', shift + 'px');
+    };
+    var pt = W.setInterval(fitPin, 400);
+    on(W, 'resize', fitPin);
+    fitPin();
+    undo.push(function () {
+      W.clearInterval(pt);
+      if (pstyle) pstyle.remove();
+      doc.documentElement.style.removeProperty('--bin-pin-shift');
+    });
+  }
 
   // ---- keep the events grid where it was ----
   var SEL = '.st-key-events_tbl .dvn-scroller';
@@ -3894,13 +4080,11 @@ _SETTING_CHECKS = {
     "opt_hol_names": _ok_list(list(HOLIDAY_BY_KEY)),
     "opt_extra_hol": lambda v: isinstance(v, list) and all(isinstance(x, str) and _iso_to_date(x) for x in v),
     "opt_weekend_days": lambda v: isinstance(v, list) and all(isinstance(x, int) and 0 <= x <= 6 for x in v),
-    "dr_rtn_early": _ok_bool,
-    "dr_req_load": _ok_choice(["ge", "gt", "eq"]), "dr_load_disp": _ok_choice(["ge", "gt", "eq"]),
-    "dr_req_ret": _ok_choice(["ge", "gt", "eq"]), "dr_load_ret": _ok_choice(["ge", "gt", "eq"]),
-    "dr_disp_ret": _ok_choice(["any", "ge", "gt", "eq"]),
+    "dr_rtn_early": _ok_bool, "pin_sidebar": _ok_bool,
     "col_waste": _ok_bool, "col_remarks": _ok_bool, "col_poss": _ok_bool, "col_paid": _ok_bool,
     "date_cells": _ok_choice(["text", "calendar"]), "year_rule": _ok_choice(["current", "closest"]),
-    "freeze_cols": _ok_list(TBL_COLS), "sort_dir": _ok_choice(["Ascending", "Descending"]),
+    "pin_cols": _ok_list(TBL_COLS), "pin_disp_copy": _ok_bool, "pin_bins": _ok_bool,
+    "sort_dir": _ok_choice(["Ascending", "Descending"]),
 }
 for _b in range(1, 6):
     _SETTING_CHECKS[f"delivery_bin_{_b}"] = lambda v: isinstance(v, date)
@@ -4058,6 +4242,13 @@ def persist_to_browser():
         pass  # the backup is a safety net; never break the app for it
 
 
+def set_holidays_cb(which):
+    keys = list(HOLIDAY_BY_KEY)
+    S["opt_hol_names"] = {"guam": [k for k in keys if "G" in HOLIDAY_BY_KEY[k][2]],
+                          "fed": [k for k in keys if "F" in HOLIDAY_BY_KEY[k][2]],
+                          "all": keys, "none": []}[which]
+
+
 def add_holiday_cb():
     d = S.get("hol_pick")
     if isinstance(d, date):
@@ -4076,17 +4267,20 @@ with st.container(key="app_header"):
 
     # A horizontal radio styled as tabs: its value lives in session_state, so any button
     # can switch pages from Python (no browser scripting).
-    _hc = st.columns([7, 1.25, 1.25], vertical_alignment="center")
+    _hc = st.columns([5.2, 1.7, 1.25, 1.25], vertical_alignment="center")
     _hc[0].radio("Page", [NAV_CALC, NAV_HIST], key="nav", horizontal=True, label_visibility="collapsed")
+    _hc[1].checkbox("📌 Pin sidebar", key="pin_sidebar",
+                    help="Keeps the sidebar open and moves the page over so the sidebar never covers it (on narrow "
+                         "windows Streamlit otherwise floats the sidebar over the page).")
     # Undo / redo for the events (also Ctrl+Z / Ctrl+Y, wired up by the helper script below).
     _on_calc = (S.get("nav") or NAV_CALC) == NAV_CALC
-    _hc[1].button("↶ Undo", key="undo_btn", on_click=undo_cb, disabled=not (S.get("undo") and _on_calc),
+    _hc[2].button("↶ Undo", key="undo_btn", on_click=undo_cb, disabled=not (S.get("undo") and _on_calc),
                   help=(f"Undo the last change to the events — Ctrl+Z ({len(S.get('undo', []))} step(s) available)."
                         if _on_calc else "Undo applies to the Calculator's events."), **STRETCH)
-    _hc[2].button("↷ Redo", key="redo_btn", on_click=redo_cb, disabled=not (S.get("redo") and _on_calc),
+    _hc[3].button("↷ Redo", key="redo_btn", on_click=redo_cb, disabled=not (S.get("redo") and _on_calc),
                   help=(f"Redo — Ctrl+Y or Ctrl+Shift+Z ({len(S.get('redo', []))} step(s) available)."
                         if _on_calc else "Redo applies to the Calculator's events."), **STRETCH)
-    components.html(_HELPER_HTML, height=0)
+    components.html(_HELPER_HTML.replace("__PIN__", "1" if S.get("pin_sidebar") else "0"), height=0)
 
 page = S.get("nav") or NAV_CALC
 page_changed = S.get("_prev_page") != page
@@ -4157,6 +4351,18 @@ with st.sidebar:
         "loaded": "Billed up to the day the bin left the site.",
         "disposal": "Billed up to the roll-off log (dump) date.",
     }[end_basis])
+    with st.expander("ℹ️ How billing basis works"):
+        st.markdown(
+            "Each bin's rental runs in **cycles**. A cycle **starts** when the bin is delivered, or after a service on "
+            "its **Return date** (back on site). It **ends** on the date chosen here. Days = end − start + 1; days "
+            "beyond the free days are billed. Days between a cycle's end and the next Return date are off site and "
+            "not billed.\n\n"
+            "- **Request** — ends the day service was asked for (shortest).\n"
+            "- **Paid** — ends the day it was paid (no Paid date → Request date).\n"
+            "- **Loaded** — ends the day the bin left the site.\n"
+            "- **Disposal** — ends the day it was dumped (longest).\n\n"
+            "Because Request ≤ Loaded ≤ Disposal, for the same bins the fee grows in that order (Paid can fall anywhere). "
+            "**Waived** = the Disposal-basis fee minus the fee on the chosen basis.")
     st.checkbox("🧾 Change billing basis per work order", key="opt_row_basis",
                 help="Adds a Fee basis column so one work order can end on its Request date, another on its "
                      "Paid date, another on its Loaded date... in the same batch. Blank = the choice above. "
@@ -4169,20 +4375,10 @@ with st.sidebar:
     st.subheader("Date rules & options")
     st.checkbox("↩️ S/Rtn may be returned before it is loaded", key="dr_rtn_early",
                 help="S/Swap (empty bin dropped, full bin picked up later) may ALWAYS have a Return date earlier "
-                     "than its Loaded date. Tick this to allow it for S/Rtn too. Return is never allowed before the "
-                     "Request date (see the order rules below).")
-    with st.expander("📐 How the dates must relate"):
-        st.caption("Loaded must be after Request and before Disposal; choose how strict each step is. "
-                   "These only decide what the table accepts.")
-        _rel = ["ge", "gt", "eq"]
-        st.selectbox("Loaded vs. Request", _rel, key="dr_req_load", format_func=lambda k: "Loaded is " + DATE_RULE_LABELS[k])
-        st.selectbox("Disposal vs. Loaded", _rel, key="dr_load_disp", format_func=lambda k: "Disposal is " + DATE_RULE_LABELS[k])
-        st.selectbox("Return vs. Request", _rel, key="dr_req_ret", format_func=lambda k: "Return is " + DATE_RULE_LABELS[k])
-        st.selectbox("S/Rtn: Return vs. Loaded", _rel, key="dr_load_ret", disabled=bool(S.get("dr_rtn_early")),
-                     format_func=lambda k: "Return is " + DATE_RULE_LABELS[k],
-                     help="Applies to S/Rtn only, and only while early returns are not allowed above.")
-        st.selectbox("S/Rtn: Return vs. Disposal", ["any", "ge", "gt", "eq"], key="dr_disp_ret",
-                     format_func=lambda k: "Return: " + DATE_RULE_LABELS[k] if k == "any" else "Return is " + DATE_RULE_LABELS[k])
+                     "than its Loaded date. Tick this to allow it for S/Rtn too. A Return is never allowed before "
+                     "the Request date.")
+    st.caption("The table only enforces what is always true: Request ≤ Loaded ≤ Disposal (same day is fine), and "
+               "a Return is never before the Request.")
     st.selectbox(
         "If Return is before Loaded, the next cycle starts on", list(RET_RULES), key="opt_ret_rule",
         format_func=lambda k: RET_RULES[k].capitalize(),
@@ -4194,20 +4390,20 @@ with st.sidebar:
                      "with a locked work order). The results are identical — it only removes impossible "
                      "choices and speeds up large batches.")
     st.checkbox("⚠️ Allow a bin lock before that bin's delivery date", key="opt_lock_early",
-                help="Off (recommended): locking a work order to a bin that was delivered AFTER it was loaded is an "
-                     "error, because it usually means a delivery date is wrong. On: accepted as an exception, "
-                     "for when you KNOW from photos that the bin was there but its delivery was never recorded. "
-                     "That bin's first cycle then starts on its (later) delivery date, so that work order bills "
-                     "0 days — check the delivery date first.")
+                help="Off (recommended): locking a work order to a bin that was delivered AFTER that work order is an "
+                     "error — it almost always means a delivery date is wrong, so fix the date. On: accepted anyway, "
+                     "only for a bin you KNOW was on site earlier but whose true delivery date you cannot enter. "
+                     "Its first cycle then starts on the (later) delivery date, so that work order bills 0 days — "
+                     "an under-charge you must be comfortable with.")
     st.checkbox("📷 Photo IDs tie work orders to the same bin", key="opt_photo_on",
                 help="Adds Photo ID columns. Work orders with the same ID are the same bin slot (you need not know "
                      "which). A swap's dropped bin ID ties it to the later work order that picks that bin up. Leave "
                      "an ID blank where you cannot tell. Turning this off ignores (but keeps) the IDs.")
     st.checkbox("…strict: different Photo ID groups are always different bins", key="opt_photo_distinct",
                 disabled=not S["opt_photo_on"],
-                help="Rarely right. A swap puts a different physical bin in the same slot, so two IDs can "
-                     "legitimately share a slot. The app already refuses two different IDs in one slot unless a "
-                     "swap sits between them; this switch refuses it even then.")
+                help="Rarely needed. “Bin 1 / Bin 2” are rental slots, and a swap puts a different physical bin in the "
+                     "same slot. The app already refuses two different Photo IDs in one slot unless a swap sits between "
+                     "them. This switch also refuses it THEN: every different Photo ID must be a different slot.")
     with st.expander("📆 Weekend & holiday waivers"):
         st.checkbox("Waive weekends", key="opt_wk_on")
         st.multiselect("Weekend days", list(range(7)), key="opt_weekend_days",
@@ -4216,7 +4412,15 @@ with st.sidebar:
         st.multiselect("Holidays that count", list(HOLIDAY_BY_KEY), key="opt_hol_names",
                        format_func=lambda k: HOLIDAY_LABEL[k], disabled=not S["opt_hol_on"],
                        help="Government of Guam holidays are pre-selected. Federal-only ones (Presidents' Day, "
-                            "Juneteenth, Columbus Day) are listed too; add or remove any.")
+                            "Juneteenth, Columbus Day) are listed too. Removed one? Re-add it here, or use the "
+                            "buttons below. Dates are worked out for each year automatically.")
+        hb = st.columns(4)
+        hb[0].button("Guam", key="hol_guam", on_click=set_holidays_cb, args=("guam",), disabled=not S["opt_hol_on"],
+                     help="Select exactly the Government of Guam holidays.", **STRETCH)
+        hb[1].button("Fed", key="hol_fed", on_click=set_holidays_cb, args=("fed",), disabled=not S["opt_hol_on"],
+                     help="Select exactly the U.S. federal holidays.", **STRETCH)
+        hb[2].button("All", key="hol_all", on_click=set_holidays_cb, args=("all",), disabled=not S["opt_hol_on"], **STRETCH)
+        hb[3].button("None", key="hol_none", on_click=set_holidays_cb, args=("none",), disabled=not S["opt_hol_on"], **STRETCH)
         st.checkbox("A holiday on a weekend counts on the Friday before / Monday after", key="opt_hol_observed",
                     disabled=not S["opt_hol_on"],
                     help="Government of Guam and federal practice: Saturday → Friday, Sunday → Monday "
@@ -4255,10 +4459,18 @@ with st.sidebar:
         st.selectbox("Dates typed without a year", ["current", "closest"], key="year_rule",
                      format_func=lambda k: {"current": "Use the current year",
                                             "closest": "Use the year closest to the previous date"}[k])
-        st.multiselect("Frozen columns", TBL_COLS, key="freeze_cols",
-                       help="Stay visible when you scroll right. Streamlit moves frozen columns to the left. The "
-                            "header row always stays visible while you scroll down (the table scrolls inside).")
-        st.caption("Reorder columns with the drag list under the table toolbar.")
+        st.checkbox("Freeze a copy of Disposal date at the left", key="pin_disp_copy",
+                    help="Streamlit always moves a frozen column to the far left, which would break your column "
+                         "order. So the real Disposal date column stays where it is and a read-only copy is frozen "
+                         "at the left. The header row always stays visible while you scroll down.")
+        st.multiselect("Also freeze these (they move to the left)", TBL_COLS, key="pin_cols",
+                       help="No (the row number) is frozen by default. Any other column you add here jumps to the left; "
+                            "keep the frozen ones narrow — Streamlit stops freezing when they take over half the table.")
+        st.checkbox("Freeze the Bin columns in the results table", key="pin_bins",
+                    help="Keeps Bin 1 / Bin 2 / … visible when you scroll the scenario table to the right. Only as "
+                         "many Bin columns as fit are frozen (Streamlit stops freezing when they take over half the "
+                         "table), and long lists are cut off — drag a column edge to widen it.")
+        st.caption("Reorder columns with the drag list above the table.")
     st.divider()
 
     st.subheader("Scenario filters")
