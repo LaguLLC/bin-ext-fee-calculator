@@ -1624,9 +1624,10 @@ def _run_parsed(parsed, free_days=None, rate=None):
     return kept
 
 
-@st.cache_data(show_spinner=False, max_entries=64)
+@st.cache_resource(show_spinner=False, max_entries=8)
 def _cached_recompute(rec_json):
-    """Cached so the History page does not recompute on every unrelated rerun."""
+    """Cached so the History page does not recompute on every unrelated rerun. (cache_resource, not cache_data: cache_data
+    hands out a pickled COPY on every call, which for thousands of scenarios took seconds. The result is read-only.)"""
     rec = json.loads(rec_json)
     parsed = parse_record_to_calc_inputs(rec)
     return _run_parsed(parsed), parsed
@@ -2101,11 +2102,23 @@ _DATA_HTML = """<script>
 </script>"""
 
 
+def inject_js(script_html):
+    """Run a <script> block in the page. components.html (an invisible iframe) is deprecated in the newest Streamlit; if it is
+    gone, st.html(unsafe_allow_javascript=True) runs the same script (window.parent is the page itself there)."""
+    try:
+        components.html(script_html, height=0)
+    except Exception:
+        try:
+            st.html(script_html, unsafe_allow_javascript=True)
+        except Exception:
+            pass
+
+
 def publish_page_data(page, cells, layout):
     """Hand the table marks / page name to the helper script in the browser (a tiny invisible iframe)."""
     blob = json.dumps({"page": page, "cells": cells, "layout": layout,
                        "top": bool(S.pop("_scroll_top_once", False))}, separators=(",", ":"))
-    components.html(_DATA_HTML.replace("__DATA__", blob.replace("</", "<\\/")), height=0)
+    inject_js(_DATA_HTML.replace("__DATA__", blob.replace("</", "<\\/")))
 
 
 def rows_to_events(rows):
@@ -2995,13 +3008,16 @@ def _bin_pin_plan(text_len, budget=330, no_w=50):
     return plan
 
 
-def build_scenario_table(results, num_bins, show_days, show_cal=False, show_dry=False):
+HIST_TABLE_CAP = 1000      # History page: how many of the cheapest / of the most expensive scenarios the table lists
+
+
+def build_scenario_table(results, num_bins, show_days, show_cal=False, show_dry=False, numbers=None):
     """Numeric columns (so sorting by Total puts $250 before $300 before $3,000)
-    plus the column_config that formats them."""
+    plus the column_config that formats them. numbers = the scenario No to print for each row (default 1, 2, 3...)."""
     nb = int(num_bins)
     rows = []
     for i, r in enumerate(results, 1):
-        row = {"No": str(i)}
+        row = {"No": str(numbers[i - 1] if numbers else i)}
         for b in range(1, nb + 1):
             row[f"Bin {b}"] = ", ".join(r["assignment"][b]) if r["assignment"][b] else "(none)"
         for b in range(1, nb + 1):
@@ -3054,9 +3070,9 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False, show_dry=
     return df, cfg
 
 
-def show_scenario_table(results, num_bins, show_days, show_cal=False):
+def show_scenario_table(results, num_bins, show_days, show_cal=False, numbers=None):
     show_dry = bool(results and results[0].get("extra"))
-    df, cfg = build_scenario_table(results, num_bins, show_days, show_cal, show_dry)
+    df, cfg = build_scenario_table(results, num_bins, show_days, show_cal, show_dry, numbers)
     data = df
     try:
         # Streamlit draws a frozen column's text in a lighter grey than the other columns, so Bin 1 looked grey and Bin 2
@@ -3067,7 +3083,8 @@ def show_scenario_table(results, num_bins, show_days, show_cal=False):
             dark = st.context.theme.type == "dark"
         except Exception:
             dark = False
-        if pinned and loose and not dark:
+        # (A Styler costs ~2 s per 16,000 rows every time the page is drawn, so it is only used on small tables.)
+        if pinned and loose and not dark and len(df) * len(df.columns) <= 3000:
             sty = df.style
             data = (getattr(sty, "map", None) or sty.applymap)(lambda v: "color: #83858c", subset=loose)
     except Exception:
@@ -3158,6 +3175,19 @@ def _esc(txt):
     return txt.replace("$", "\\$")
 
 
+def metric_cards(items):
+    """A responsive row of headline numbers (small label above a big value). Unlike st.columns + st.metric it wraps onto
+    more lines instead of squeezing a long value into a narrow column and overlapping its neighbour.
+    items = [(label, value, tooltip or "")]"""
+    def esc(t):
+        return _html.escape(str(t), quote=True).replace("$", "&#36;")      # "$" would start LaTeX in markdown
+    cells = []
+    for label, value, tip in items:
+        cells.append(f'<div class="bin-metric"{(" title=" + chr(34) + esc(tip) + chr(34)) if tip else ""}>'
+                     f'<div class="bin-metric-l">{esc(label)}</div><div class="bin-metric-v">{esc(value)}</div></div>')
+    st.markdown('<div class="bin-metrics">' + "".join(cells) + "</div>", unsafe_allow_html=True)
+
+
 def render_total_metrics(results, show_days, opts, n_dry, show_waived=True):
     """The headline numbers. Extension fees and dry run fees are always shown apart; the dry run fee is only added
     into a clearly labelled 'Total incl. dry runs'."""
@@ -3165,19 +3195,32 @@ def render_total_metrics(results, show_days, opts, n_dry, show_waived=True):
     dlo, dhi = results[0].get("total_ext_days", 0), results[-1].get("total_ext_days", 0)
     extra = results[0].get("extra", 0)
     fee = normalize_opts(opts)["dry_fee"]
-    cols = st.columns(3 + (2 if extra else 0))
-    cols[0].metric("Extension fees (min – max)", _esc(fmt_range(lo, hi, dlo, dhi, show_days)))
-    cols[1].metric("Range", f"${hi - lo:,.0f}")
+    items = [("Extension fees (min – max)", fmt_range(lo, hi, dlo, dhi, show_days), ""),
+             ("Range", f"${hi - lo:,.0f}", "Highest minus lowest extension fees.")]
     if show_waived:
         w_vals = [r.get("waived", 0) for r in results]
         wd_vals = [r.get("waived_days", 0) for r in results]
-        cols[2].metric("Waived (min – max)", _esc(fmt_range(min(w_vals), max(w_vals), min(wd_vals), max(wd_vals), show_days)))
+        items.append(("Waived (min – max)", fmt_range(min(w_vals), max(w_vals), min(wd_vals), max(wd_vals), show_days),
+                      "Fee if every cycle ended on its Disposal date, minus the fee on the chosen basis."))
     if extra:
-        cols[3].metric("Dry run fees", f"${extra:,.0f}", help=f"{n_dry} dry run(s) × ${fee:,.2f}. Not included in the extension fees.")
-        cols[4].metric("Total incl. dry runs (min – max)", _esc(fmt_range(lo + extra, hi + extra, dlo, dhi, show_days)))
+        items.append(("Dry run fees", f"${extra:,.0f}", f"{n_dry} dry run(s) × ${fee:,.2f}. Not included in the extension fees."))
+        items.append(("Total incl. dry runs (min – max)", fmt_range(lo + extra, hi + extra, dlo, dhi, show_days), ""))
+    metric_cards(items)
     if extra:
-        st.caption(f"Dry run fees: {n_dry} × ${fee:,.2f} = ${extra:,.2f}, added on top of the extension fees "
-                   "(it is the same in every scenario).")
+        st.caption(_esc(f"Dry run fees: {n_dry} × ${fee:,.2f} = ${extra:,.2f}, added on top of the extension fees "
+                        "(it is the same in every scenario)."))
+
+
+def capped_for_history(results):
+    """History page: a run can have tens of thousands of scenarios. Drawing them all takes seconds, so the table lists the
+    cheapest and the most expensive ones (the totals above it always use every scenario). -> (rows, numbers, note)"""
+    n = len(results)
+    if n <= 2 * HIST_TABLE_CAP:
+        return results, None, ""
+    k = HIST_TABLE_CAP
+    return (results[:k] + results[-k:], list(range(1, k + 1)) + list(range(n - k + 1, n + 1)),
+            f"The table lists the {k:,} cheapest and the {k:,} most expensive of {n:,} scenarios (the totals above use all "
+            "of them). This keeps the History page quick.")
 
 
 def basis_caption(end_basis):
@@ -3253,7 +3296,7 @@ def render_results(cached, filters, show_tree, show_days, show_timeline, interch
     cal = cached.get("cal")
     summary = options_summary(cached.get("opts"), cached.get("dry_n", 0))
     if summary:
-        st.caption("⚙️ Options in effect: " + "; ".join(summary) + ".")
+        st.caption(_esc("⚙️ Options in effect: " + "; ".join(summary) + "."))
     if cached.get("auto"):
         st.caption("🔒 Auto-assigned (only one bin could have been on site): " + ", ".join(
             f"row {events[i].get('src', i) + 1} → Bin {fixed_assignments[i]}" for i in sorted(cached["auto"])) + ".")
@@ -3369,7 +3412,8 @@ def render_results(cached, filters, show_tree, show_days, show_timeline, interch
 def render_static_view_of_record(rec, show_days):
     """Read-only display of a saved run's results."""
     try:
-        results, parsed = recompute_from_record(rec)
+        with st.spinner("Calculating this run's scenarios…"):
+            results, parsed = recompute_from_record(rec)
     except TooManyScenarios as ex:
         st.warning(str(ex))
         return
@@ -3394,10 +3438,13 @@ def render_static_view_of_record(rec, show_days):
     n_dry = sum(1 for e in parsed["events"] if e["type"] == DRY_RUN)
     summary = options_summary(parsed["opts"], n_dry)
     if summary:
-        st.caption("⚙️ Options in effect: " + "; ".join(summary) + ".")
+        st.caption(_esc("⚙️ Options in effect: " + "; ".join(summary) + "."))
     render_total_metrics(results, show_days, parsed["opts"], n_dry, show_waived=False)
     st.metric("Scenarios", f"{len(results):,}")
-    show_scenario_table(results, parsed["num_bins"], show_days, make_cal(parsed["opts"]) is not None)
+    shown, numbers, note = capped_for_history(results)
+    if note:
+        st.caption(note)
+    show_scenario_table(shown, parsed["num_bins"], show_days, make_cal(parsed["opts"]) is not None, numbers)
     with st.expander("🧾 Work orders in this run (audit)"):
         st.dataframe(record_events_df(parsed), hide_index=True, **STRETCH)
 
@@ -3470,7 +3517,10 @@ def render_rerun_results(rec, new_free_days, new_rate, show_days):
               delta=f"${lowest - orig_min:+,.0f}")
     m2.metric("Highest extension fees (new)", fmt_fee(highest, results[-1].get("total_ext_days", 0), show_days),
               delta=f"${highest - orig_max:+,.0f}")
-    show_scenario_table(results, parsed["num_bins"], show_days, make_cal(parsed["opts"]) is not None)
+    shown, numbers, note = capped_for_history(results)
+    if note:
+        st.caption(note)
+    show_scenario_table(shown, parsed["num_bins"], show_days, make_cal(parsed["opts"]) is not None, numbers)
 
 
 # ──────────────────────────────────────────────
@@ -4356,9 +4406,9 @@ def inject_css():
         .st-key-app_header {{
             padding: .25rem 0 .35rem 0; gap: .35rem; border-bottom: 1px solid {edge};
         }}
-        /* long metric values wrap instead of being cut off with an ellipsis */
-        [data-testid="stMetricValue"], [data-testid="stMetricValue"] > div {{
-            overflow: visible !important; text-overflow: clip !important; white-space: normal !important;
+        /* long metric text wraps instead of being cut off or spilling into the next column */
+        [data-testid="stMetric"], [data-testid="stMetric"] * {{
+            white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
             overflow-wrap: anywhere;
         }}
         .st-key-app_header .app-title {{ font-size: 1.7rem; font-weight: 700; line-height: 1.35; padding-bottom: .35rem; }}
@@ -4384,6 +4434,16 @@ def inject_css():
         .bin-err-box ul {{ margin: .3rem 0 0 0; padding-left: 1.2rem; }}
         .bin-goto {{ cursor: pointer; font-weight: 600; text-decoration: underline dotted; }}
         .bin-goto:hover {{ text-decoration: underline; }}
+        /* rows of controls wrap onto more lines (never squeeze a button / box until its text breaks apart) */
+        [data-testid="stMain"] [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap !important; row-gap: .5rem; }}
+        [data-testid="stMain"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {{
+            min-width: min(100%, 9.5rem) !important; }}
+        /* headline number cards: they wrap onto more lines instead of squeezing / overlapping */
+        .bin-metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+                        gap: .5rem 1.5rem; margin: .25rem 0 .75rem; }}
+        .bin-metric {{ min-width: 0; }}
+        .bin-metric-l {{ font-size: .875rem; opacity: .72; line-height: 1.3; overflow-wrap: anywhere; }}
+        .bin-metric-v {{ font-size: 2rem; line-height: 1.2; overflow-wrap: anywhere; }}
         </style>""",
         unsafe_allow_html=True,
     )
@@ -4402,6 +4462,7 @@ _HELPER_HTML = """<script>
   if (W._binDispose) { try { W._binDispose(); } catch (e) {} }
   var disposed = false, undo = [];
   function on(t, ev, fn, opt) { t.addEventListener(ev, fn, opt); undo.push(function () { t.removeEventListener(ev, fn, opt); }); }
+  function num(a, b) { return a - b; }
 
   // ---- keyboard shortcuts ----
   on(doc, 'keydown', function (e) {
@@ -4409,7 +4470,7 @@ _HELPER_HTML = """<script>
     var k = (e.key || '').toLowerCase();
     if (k === 'enter' && e.ctrlKey) {
       var calc = doc.querySelector('.st-key-calc_btn button');
-      if (calc) { calc.click(); e.preventDefault(); }
+      if (calc && !calc.disabled) { calc.click(); e.preventDefault(); }
       return;
     }
     var redo = (k === 'y') || (k === 'z' && e.shiftKey), undoK = (k === 'z' && !e.shiftKey);
@@ -4422,22 +4483,29 @@ _HELPER_HTML = """<script>
     if (!btn.disabled) btn.click();
   }, true);
 
-  // ---- the 📌 button: small, only while the sidebar is open, beside the sidebar's « button ----
-  // Pinned = whenever the sidebar is open and would cover the page (narrow windows), the page is moved over by the
-  // amount it covers. The sidebar can still be collapsed with its own button; the page then moves back.
-  // The on/off state is kept in this browser (localStorage), so toggling it never reruns the app.
+  // ---- the 📌 pin button: top-left corner of the OPEN sidebar (where the « / » button of a collapsed sidebar is) ----
+  // Pinned = while the sidebar is open and there is room for both, the page is moved over by the amount the sidebar covers.
+  // The on/off state is kept in this browser (localStorage), so toggling it never reruns the app. The button sits in a
+  // zero-height sticky strip INSIDE the sidebar's scroll container: it stays visible while the sidebar is scrolled, and
+  // a click on it counts as "inside the sidebar" (Streamlit closes a narrow-window sidebar on any click outside it).
   var pinOn = false;
   try { pinOn = W.localStorage.getItem('bin_calc_pin_sidebar') === '1'; } catch (e) {}
-  var pbtn = doc.getElementById('bin-pin-btn');
-  if (pbtn) pbtn.remove();
+  function sidebarEl() { return doc.querySelector('[data-testid="stSidebar"]'); }
+  function sidebarOpen() {                     // by geometry: the attribute that says so differs between Streamlit versions
+    var sb = sidebarEl(); if (!sb) return false;
+    var r = sb.getBoundingClientRect();
+    return r.width > 40 && r.right > 40;
+  }
+  var pbtn = doc.getElementById('bin-pin-btn'); if (pbtn) pbtn.remove();
   pbtn = doc.createElement('button');
   pbtn.id = 'bin-pin-btn'; pbtn.type = 'button'; pbtn.textContent = '📌';
-  pbtn.style.cssText = 'position:absolute;z-index:5;top:16px;left:200px;width:22px;height:22px;padding:0;display:none;' +
-    'border-radius:5px;cursor:pointer;font-size:11px;line-height:1;color:inherit;';
+  // 18px wide, in the 20px left gutter of the sidebar: it never sits on top of a label or a control
+  pbtn.style.cssText = 'position:absolute;left:1px;top:0;width:18px;height:18px;padding:0;display:none;' +
+    'border-radius:4px;cursor:pointer;font-size:9px;line-height:1;color:inherit;';
   function paintPin() {
     pbtn.setAttribute('aria-pressed', pinOn ? 'true' : 'false');
-    pbtn.title = pinOn ? 'Pinned: the page is moved over so the sidebar never covers it — click to unpin'
-                       : 'Pin: move the page over so the sidebar never covers it';
+    pbtn.title = pinOn ? 'Pinned: while there is room, the page moves over so the sidebar never covers it. Click to unpin.'
+                       : 'Pin: while there is room, move the page over so the sidebar never covers it.';
     pbtn.style.background = pinOn ? 'rgba(128,128,128,.40)' : 'transparent';
     pbtn.style.border = pinOn ? '1px solid rgba(128,128,128,.9)' : '1px solid rgba(128,128,128,.45)';
     pbtn.style.opacity = pinOn ? '1' : '.65';
@@ -4448,13 +4516,17 @@ _HELPER_HTML = """<script>
   pstyle.textContent = '[data-testid="stMain"]{margin-left:var(--bin-pin-shift,0px) !important;' +
     'width:calc(100% - var(--bin-pin-shift,0px)) !important;min-width:0 !important;}';
   function fitPin() {
-    var sb = doc.querySelector('[data-testid="stSidebar"]'), mn = doc.querySelector('[data-testid="stMain"]');
+    var sb = sidebarEl(), mn = doc.querySelector('[data-testid="stMain"]');
     if (!sb || !mn) return;
     if (!pinOn) { doc.documentElement.style.removeProperty('--bin-pin-shift'); if (pstyle.parentNode) pstyle.remove(); return; }
     if (!pstyle.parentNode) doc.head.appendChild(pstyle);
     doc.documentElement.style.setProperty('--bin-pin-shift', '0px');
-    var shift = sb.getAttribute('aria-expanded') === 'false' ? 0 :
-      Math.max(0, Math.round(sb.getBoundingClientRect().right - mn.getBoundingClientRect().left));
+    var shift = 0;
+    if (sidebarOpen()) {
+      var sr = sb.getBoundingClientRect(), mr = mn.getBoundingClientRect();
+      shift = Math.max(0, Math.round(sr.right - mr.left));
+      if (W.innerWidth - sr.right < 320) shift = 0;          // not enough room for both: leave the sidebar floating
+    }
     doc.documentElement.style.setProperty('--bin-pin-shift', shift + 'px');
   }
   pbtn.onclick = function (e) {
@@ -4462,27 +4534,31 @@ _HELPER_HTML = """<script>
     pinOn = !pinOn; try { W.localStorage.setItem('bin_calc_pin_sidebar', pinOn ? '1' : '0'); } catch (x) {}
     paintPin(); fitPin();
   };
-  // The button lives INSIDE the sidebar's scrolling container (in a zero-height "sticky" strip, so it stays put while the
-  // sidebar is scrolled): on narrow windows Streamlit closes the sidebar when you press the mouse anywhere outside that
-  // container, which a button placed elsewhere would count as.
   var pwrap = doc.getElementById('bin-pin-wrap'); if (pwrap) pwrap.remove();
   pwrap = doc.createElement('div'); pwrap.id = 'bin-pin-wrap';
   pwrap.style.cssText = 'position:sticky;top:10px;height:0;z-index:50;overflow:visible;';
   pwrap.appendChild(pbtn);
-  pbtn.style.top = '0px';
   function placePin() {
-    var sb = doc.querySelector('[data-testid="stSidebar"]');
-    if (!sb || sb.getAttribute('aria-expanded') === 'false') { pbtn.style.display = 'none'; return; }
-    var r = sb.getBoundingClientRect();
-    if (r.right < 60) { pbtn.style.display = 'none'; return; }
-    var host = sb.querySelector('[data-testid="stSidebarContent"]') || sb;
+    if (!sidebarOpen()) { pbtn.style.display = 'none'; return; }
+    var sb = sidebarEl(), host = sb.querySelector('[data-testid="stSidebarContent"]') || sb;
     if (pwrap.parentNode !== host) host.insertBefore(pwrap, host.firstChild);
-    pbtn.style.display = 'block'; pbtn.style.left = Math.max(4, Math.round(r.width - 74)) + 'px';
+    pbtn.style.display = 'block';
+    // the strip starts at the sidebar's padding edge: shift the button back so it sits in the sidebar's left gutter
+    var off = pwrap.getBoundingClientRect().left - sb.getBoundingClientRect().left;
+    pbtn.style.left = Math.max(-30, Math.round(1 - off)) + 'px';
   }
   var ppt = W.setInterval(placePin, 300);
   on(W, 'resize', placePin);
   placePin();
-  undo.push(function () { W.clearInterval(ppt); if (pwrap) pwrap.remove(); });
+  var fpt = W.setInterval(fitPin, 400);
+  on(W, 'resize', fitPin);
+  fitPin();
+  undo.push(function () {
+    W.clearInterval(ppt); W.clearInterval(fpt);
+    if (pwrap) pwrap.remove();
+    if (pstyle.parentNode) pstyle.remove();
+    doc.documentElement.style.removeProperty('--bin-pin-shift');
+  });
 
   // ---- a dropdown opened inside the table must not float in place when the page scrolls: close it ----
   var ovSeen = null, ovT = 0;
@@ -4501,20 +4577,21 @@ _HELPER_HTML = """<script>
     a.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true}));
   }, true);
 
-  // ---- marks drawn over the table: blocking problems (red) and pre-filled dates (light blue), tooltips, jump ----
-  // The table is a canvas, so its cell positions are read from what it drew: the vertical lines in its header strip
-  // and the horizontal lines in its body. Column names come from the table's (hidden) accessibility header.
+  // ---- marks drawn over the table: blocking problems (red) and pre-filled dates (light blue) ----
+  // The table is a canvas, so its cell positions are worked out from (a) the column widths the app set, (b) the thin
+  // grid lines that were actually drawn (used to line everything up to the pixel and to notice a column that was dragged),
+  // and (c) the scroll position. Scrollbar widths, device pixel ratio and Streamlit version do not matter.
   var GRID = '.st-key-events_tbl [data-testid="stDataFrame"]';
   ['bin-marks', 'bin-tip', 'bin-marks-style'].forEach(function (id) { var o = doc.getElementById(id); if (o) o.remove(); });
   var MST = doc.createElement('style'); MST.id = 'bin-marks-style';
-  MST.textContent = '@keyframes binblink{0%{opacity:0}20%{opacity:1}70%{opacity:1}100%{opacity:0}}' +
-    '.bin-blink{position:absolute;box-sizing:border-box;border:3px solid #ff2b2b;border-radius:3px;' +
-    'box-shadow:0 0 0 4px rgba(255,43,43,.35);animation:binblink 1.3s ease-out 1 forwards;pointer-events:none}';
+  MST.textContent = '@keyframes binblink{0%{opacity:0}15%{opacity:1}60%{opacity:1}100%{opacity:0}}' +
+    '.bin-blink{position:absolute;box-sizing:border-box;border:3px solid #ff1f1f;border-radius:3px;' +
+    'box-shadow:0 0 0 5px rgba(255,31,31,.35);animation:binblink 1.5s ease-out 1 forwards;pointer-events:none}';
   doc.head.appendChild(MST);
   var ROOT = doc.createElement('div'); ROOT.id = 'bin-marks';
   ROOT.style.cssText = 'position:fixed;z-index:900;pointer-events:none;overflow:hidden;display:none;';
   var MK = doc.createElement('div'); MK.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;';
-  ROOT.appendChild(MK);                  // the marks live in MK (rebuilt every refresh); a blink is added to ROOT itself
+  ROOT.appendChild(MK);
   doc.body.appendChild(ROOT);
   var TIP = doc.createElement('div'); TIP.id = 'bin-tip';
   TIP.style.cssText = 'position:fixed;z-index:1000001;display:none;max-width:300px;padding:6px 9px;border-radius:6px;' +
@@ -4522,75 +4599,118 @@ _HELPER_HTML = """<script>
     'box-shadow:0 2px 8px rgba(0,0,0,.35);';
   doc.body.appendChild(TIP);
   undo.push(function () { ROOT.remove(); TIP.remove(); MST.remove(); });
-  var boxes = [], tipLock = 0;
+  var boxes = [], tipLock = 0, lastClick = null;
   function lum(d, i) { return 0.3 * d[4 * i] + 0.59 * d[4 * i + 1] + 0.11 * d[4 * i + 2]; }
   function lines(arr) {                    // positions (px) of thin dark lines in a 1-px-wide strip of pixels
-    var s = arr.slice().sort(function (a, b) { return a - b; }), bg = s[Math.floor(s.length * 0.7)], out = [], i;
+    var s = arr.slice().sort(num), bg = s[Math.floor(s.length * 0.7)], out = [], i;
     for (i = 0; i < arr.length; i++) {
-      if (arr[i] < bg - 12) { out.push(i); while (i + 1 < arr.length && arr[i + 1] < bg - 12) i++; }
+      if (arr[i] < bg - 10) { out.push(i); while (i + 1 < arr.length && arr[i + 1] < bg - 10) i++; }
     }
     return out;
+  }
+  function near(list, v, tol) {            // the entry of list closest to v (within tol), else null
+    var best = null, bd = tol + 1e-6, i;
+    for (i = 0; i < list.length; i++) { var d = Math.abs(list[i] - v); if (d <= bd) { bd = d; best = list[i]; } }
+    return best;
   }
   function readGeom() {
     try {
       var g = doc.querySelector(GRID); if (!g) return null;
       var cs = g.querySelectorAll('canvas'), sc = g.querySelector('.dvn-scroller'); if (!cs.length || !sc) return null;
-      var hc = cs[0], bc = cs[0], i;
+      var lay = (W._binData || {}).layout || []; if (!lay.length) return null;
+      var hc = cs[0], bc = cs[0], i, x, y;
       for (i = 0; i < cs.length; i++) { if (cs[i].height < hc.height) hc = cs[i]; if (cs[i].height > bc.height) bc = cs[i]; }
       var gr = g.getBoundingClientRect(), hr = hc.getBoundingClientRect();
       if (!hr.width || !hr.height) return null;
-      var dpr = hc.width / hr.width, x, y, arr = [];
-      // the row-marker column's right edge = the first vertical line in the header strip
-      var hd = hc.getContext('2d').getImageData(0, Math.min(hc.height - 1, Math.round(2 * dpr)), hc.width, 1).data;
+      var dpr = hc.width / hr.width, visW = sc.clientWidth, visH = sc.clientHeight, arr = [];
+      // vertical lines in the header strip
+      var yy = Math.min(hc.height - 1, Math.max(0, Math.round(2 * dpr)));
+      var hd = hc.getContext('2d').getImageData(0, yy, hc.width, 1).data;
       for (x = 0; x < hc.width; x++) arr.push(lum(hd, x));
-      var edges = lines(arr).map(function (v) { return v / dpr; });
-      var markerW = edges.length ? edges[0] : 32;
-      // row height = spacing of the horizontal lines in the body
-      var bd = bc.getContext('2d').getImageData(Math.round(3 * dpr), 0, 1, bc.height).data; arr = [];
+      var edges = lines(arr).map(function (v) { return v / dpr; }).filter(function (v) { return v < visW + 1; });
+      var markerW = (edges.length && edges[0] >= 18 && edges[0] <= 64) ? edges[0] : 32;
+      // horizontal lines in the body (inside the row-marker column)
+      var bd = bc.getContext('2d').getImageData(Math.max(0, Math.round(3 * dpr)), 0, 1, bc.height).data; arr = [];
       for (y = 0; y < bc.height; y++) arr.push(lum(bd, y));
       var seps = lines(arr).map(function (v) { return v / dpr; }), diffs = [];
       for (i = 1; i < seps.length; i++) diffs.push(seps[i] - seps[i - 1]);
-      diffs.sort(function (a, b) { return a - b; });
-      var rh = diffs.length ? diffs[Math.floor(diffs.length / 2)] : 25;
-      var hh = cs.length > 1 ? hr.height : (seps.length ? seps[0] + 1 : rh);
-      // columns: known widths, frozen first
-      var lay = (W._binData || {}).layout || [], cols = {}, pinW = markerW, run = 0, total = markerW;
+      var rh = 25, hh = hr.height - 1;
+      if (diffs.length >= 2) {
+        var ds = diffs.slice().sort(num), med = ds[ds.length >> 1];
+        if (med > 12 && med < 90) {                                  // longest run of evenly spaced lines -> row height
+          var bs = 0, be = 0, s0 = 0;
+          for (i = 0; i <= diffs.length; i++) {
+            if (i === diffs.length || Math.abs(diffs[i] - med) > 1.6) { if (i - s0 > be - bs) { bs = s0; be = i; } s0 = i + 1; }
+          }
+          rh = be > bs ? (seps[be] - seps[bs]) / (be - bs) : med;
+        }
+      }
+      if (seps.length) {                                             // header height: line up with the lines really drawn
+        var offs = [];
+        for (i = 0; i < seps.length; i++) {
+          var k = Math.round((seps[i] + sc.scrollTop - hh) / rh), e = seps[i] - (hh + k * rh - sc.scrollTop);
+          if (k >= 0 && Math.abs(e) <= 4) offs.push(e);
+        }
+        if (offs.length) { offs.sort(num); hh += offs[offs.length >> 1]; }
+      }
+      // columns: widths set by the app; frozen ones first
+      var cols = {}, pinR = markerW, run = 0, pred = [markerW];
+      lay.forEach(function (c) { if (c.p) { cols[c.c] = {pinned: true, left: pinR, w: c.w}; pinR += c.w; pred.push(pinR); } });
       lay.forEach(function (c) {
-        total += c.w;
-        if (c.p) { cols[c.c] = {pinned: true, left: pinW, w: c.w}; pinW += c.w; }
+        if (!c.p) { cols[c.c] = {pinned: false, cum: run, w: c.w}; run += c.w;
+                    var rx = pinR + run - sc.scrollLeft; if (rx > pinR && rx <= visW + 1) pred.push(rx); }
       });
-      lay.forEach(function (c) { if (!c.p) { cols[c.c] = {pinned: false, cum: run, w: c.w}; run += c.w; } });
-      var ok = lay.length > 0 && Math.abs(sc.scrollWidth - total) <= 6;      // false if a column was dragged wider/narrower
-      return {g: g, sc: sc, gr: gr, hr: hr, rh: rh, hh: hh, cols: cols, pinR: pinW, W: hr.width, ok: ok, total: total};
+      var m = 0, tot = 0;                                            // do the drawn vertical lines match the widths we set?
+      for (i = 1; i < edges.length; i++) { tot++; if (near(pred, edges[i], 3.5) !== null) m++; }
+      var okCols = tot < 2 || m >= Math.ceil(0.6 * tot);
+      return {g: g, sc: sc, gr: gr, hr: hr, rh: rh, hh: hh, cols: cols, pinR: pinR, visW: visW, visH: visH,
+              edges: edges, seps: seps, okCols: okCols, markerW: markerW};
     } catch (e) { return null; }
   }
-  function cellRect(G, r, name) {
-    var c = G.cols[name]; if (!c || !G.ok) return null;
-    var left = c.pinned ? c.left : G.pinR + c.cum - G.sc.scrollLeft, right = left + c.w;
-    var top = G.hh + (r - 1) * G.rh - G.sc.scrollTop;
-    var l = left, w = c.w, t = top, h = G.rh;
-    if (!c.pinned && l < G.pinR) { w -= (G.pinR - l); l = G.pinR; }
-    if (t < G.hh) { h -= (G.hh - t); t = G.hh; }
-    if (l + w > G.W) w = G.W - l;
-    if (t + h > G.gr.height) h = G.gr.height - t;
-    return {l: l, t: t, w: w, h: h, ok: w > 2 && h > 2, pinned: c.pinned, fullL: left, fullR: right};
+  function rowRect(G, r) {
+    var t = G.hh + (r - 1) * G.rh - G.sc.scrollTop, n = near(G.seps, t, 2.5);
+    if (n !== null) t = n;
+    var b = t + G.rh;
+    if (t < G.hh) t = G.hh;
+    if (b > G.visH) b = G.visH;
+    return {t: t, h: b - t, ok: b - t > 3};
   }
-  W._binGeom = readGeom; W._binCell = cellRect;   // (kept on the window so it can be inspected when testing)
+  function cellRect(G, r, name) {
+    var c = G.cols[name], rr = rowRect(G, r); if (!c || !G.okCols || !rr.ok) return null;
+    var left = c.pinned ? c.left : G.pinR + c.cum - G.sc.scrollLeft, right = left + c.w, n;
+    if ((n = near(G.edges, left, 2.5)) !== null) left = n;
+    if ((n = near(G.edges, right, 2.5)) !== null) right = n;
+    var l = left, w = right - left;
+    if (!c.pinned && l < G.pinR) { w -= (G.pinR - l); l = G.pinR; }
+    if (l + w > G.visW) w = G.visW - l;
+    return {l: l, t: rr.t, w: w, h: rr.h, ok: w > 3 && rr.h > 3, pinned: c.pinned};
+  }
+  W._binGeom = readGeom; W._binCell = cellRect;                     // (kept on the window so it can be inspected when testing)
   function drawMarks() {
     var D = W._binData || {}, cells = D.cells || [], G = cells.length ? readGeom() : null;
     boxes = [];
-    if (!G || !G.ok) { ROOT.style.display = 'none'; MK.innerHTML = ''; return; }
+    if (!G) { ROOT.style.display = 'none'; MK.innerHTML = ''; return; }
     var ox = G.hr.left - G.gr.left, oy = G.hr.top - G.gr.top;
     ROOT.style.left = G.gr.left + 'px'; ROOT.style.top = G.gr.top + 'px';
-    ROOT.style.width = G.gr.width + 'px'; ROOT.style.height = G.gr.height + 'px'; ROOT.style.display = 'block';
-    var html = '', order = cells.slice().sort(function (a, b) { return (a.k === 'err') - (b.k === 'err'); });
+    ROOT.style.width = (G.visW + ox) + 'px'; ROOT.style.height = (G.visH + oy) + 'px'; ROOT.style.display = 'block';
+    var html = '', done = {};
+    function box(l, t, w, h, css, c) {
+      html += '<div style="position:absolute;box-sizing:border-box;left:' + (ox + l) + 'px;top:' + (oy + t) + 'px;width:' + w +
+        'px;height:' + h + 'px;' + css + '"></div>';
+      boxes.push({l: G.hr.left + l, t: G.hr.top + t, w: w, h: h, text: c.t});
+    }
+    var order = cells.slice().sort(function (a, b) { return (a.k === 'err') - (b.k === 'err'); });
     order.forEach(function (c) {
+      var rr = rowRect(G, c.r); if (!rr.ok) return;
+      if (c.k === 'err') {
+        var key = 'r' + c.r;
+        if (!done[key]) { done[key] = 1;                                // a light red band over the whole row
+          box(G.markerW, rr.t, G.visW - G.markerW, rr.h, 'background:rgba(255,75,75,' + (G.okCols ? '.10' : '.28') + ');' +
+              (G.okCols ? '' : 'border-top:1px solid rgba(255,75,75,.9);border-bottom:1px solid rgba(255,75,75,.9);'), c); }
+      }
       var rc = cellRect(G, c.r, c.c); if (!rc || !rc.ok) return;
-      html += '<div style="position:absolute;box-sizing:border-box;left:' + (ox + rc.l) + 'px;top:' + (oy + rc.t) + 'px;width:' +
-        rc.w + 'px;height:' + rc.h + 'px;' + (c.k === 'err'
-          ? 'background:rgba(255,75,75,.24);border:1px solid rgba(255,75,75,.9);'
-          : 'background:rgba(66,133,244,.11);') + '"></div>';
-      boxes.push({l: G.hr.left + rc.l, t: G.hr.top + rc.t, w: rc.w, h: rc.h, k: c.k, text: c.t});
+      box(rc.l, rc.t, rc.w, rc.h, c.k === 'err' ? 'background:rgba(255,60,60,.38);border:1px solid rgba(235,40,40,.95);'
+                                              : 'background:rgba(66,133,244,.12);', c);
     });
     MK.innerHTML = html;
   }
@@ -4601,11 +4721,13 @@ _HELPER_HTML = """<script>
   on(doc, 'scroll', drawSoon, true);
   on(W, 'resize', drawSoon);
   on(W, 'bin-data', function () { drawSoon(); pageScroll(); });
-  function showTip(text, x, y) {
+  function showTip(text, x, y, above) {
     TIP.textContent = text; TIP.style.display = 'block';
-    var w = TIP.offsetWidth, h = TIP.offsetHeight;
-    TIP.style.left = Math.max(4, Math.min(W.innerWidth - w - 6, x + 12)) + 'px';
-    TIP.style.top = Math.max(4, (y + 18 + h > W.innerHeight) ? y - h - 10 : y + 18) + 'px';
+    var w = TIP.offsetWidth, h = TIP.offsetHeight, vw = W.innerWidth, vh = W.innerHeight;
+    var left = Math.max(6, Math.min(vw - w - 6, x)), top = above ? y - h - 8 : y;
+    if (top + h > vh - 6) top = y - h - 8;
+    if (top < 6) top = 6;
+    TIP.style.left = left + 'px'; TIP.style.top = top + 'px';
   }
   on(doc, 'mousemove', function (e) {
     if (Date.now() < tipLock) return;
@@ -4614,38 +4736,57 @@ _HELPER_HTML = """<script>
       var b = boxes[i];
       if (e.clientX >= b.l && e.clientX < b.l + b.w && e.clientY >= b.t && e.clientY < b.t + b.h) { hit = b; break; }
     }
-    if (hit) showTip(hit.text, e.clientX, e.clientY); else TIP.style.display = 'none';
+    if (hit) showTip(hit.text, e.clientX + 12, e.clientY + 18); else TIP.style.display = 'none';
   });
+  function blink(l, t, w, h) {
+    var G = readGeom(); if (!G) return;
+    var bl = doc.createElement('div'); bl.className = 'bin-blink';
+    bl.style.cssText = 'left:' + (G.hr.left - G.gr.left + l - 1) + 'px;top:' + (G.hr.top - G.gr.top + t - 1) + 'px;width:' + (w + 2) + 'px;height:' + (h + 2) + 'px;';
+    ROOT.appendChild(bl); setTimeout(function () { bl.remove(); }, 1600);
+  }
   function gotoCell(r, name) {
     var D = W._binData || {}, errs = (D.cells || []).filter(function (c) { return c.k === 'err' && c.r === r; });
     if (!errs.length) return;
     var tgt = null, i;
     for (i = 0; i < errs.length; i++) if (errs[i].c === name) tgt = errs[i];
     tgt = tgt || errs[0];
-    var G = readGeom(); if (!G) return;
-    if (G.gr.top < 150 || G.gr.bottom > W.innerHeight - 10) G.g.scrollIntoView({block: 'center'});       // bring the table into view
-    var rh = G.rh || 25, vis = G.gr.height - G.hh, rowTop = (tgt.r - 1) * rh, st = G.sc.scrollTop;
-    if (rowTop < st || rowTop + rh > st + vis) G.sc.scrollTop = Math.max(0, rowTop - (vis - rh) / 2);     // ...the row
+    var G = readGeom(); if (!G) { if (lastClick) { showTip(tgt.t, lastClick.l, lastClick.b + 6, false); tipLock = Date.now() + 5000; } return; }
+    var main = doc.querySelector('[data-testid="stMain"]'), head = doc.querySelector('.st-key-app_header');
+    // 1) inside the table: bring the row (and the column) into view
+    var rowTop = G.hh + (tgt.r - 1) * G.rh, sc = G.sc;
+    if (rowTop < sc.scrollTop + G.hh || rowTop + G.rh > sc.scrollTop + G.visH)
+      sc.scrollTop = Math.max(0, rowTop - G.hh - (G.visH - G.hh - G.rh) / 2);
     var col = G.cols[tgt.c];
-    if (col && !col.pinned) {                                                                          // ...and the column
-      var room = G.W - G.pinR, sl = G.sc.scrollLeft;
-      if (col.cum < sl || col.cum + col.w > sl + room) G.sc.scrollLeft = Math.max(0, col.cum - (room - col.w) / 2);
+    if (col && !col.pinned) {
+      var room = G.visW - G.pinR;
+      if (col.cum < sc.scrollLeft || col.cum + col.w > sc.scrollLeft + room) sc.scrollLeft = Math.max(0, col.cum - (room - col.w) / 2);
     }
+    // 2) the page: put that row in the middle of the visible part of the window (below the sticky header)
+    var rowY = G.hr.top + rowTop - sc.scrollTop;
+    var topLim = (head ? head.getBoundingClientRect().bottom : 0) + 14, botLim = W.innerHeight - 30;
+    if (main && (rowY < topLim || rowY + G.rh > botLim)) main.scrollTop += rowY - (topLim + Math.max(0, botLim - topLim - G.rh) / 2);
+    // 3) once things have settled: flash the cell and explain it
     setTimeout(function () {
       drawMarks();
-      var G3 = readGeom(), rc3 = G3 ? cellRect(G3, tgt.r, tgt.c) : null;
-      if (!G3 || !rc3 || !rc3.ok) { showTip(tgt.t, G.hr.left + 40, G.hr.top + 40); tipLock = Date.now() + 5000; return; }
-      var bl = doc.createElement('div'); bl.className = 'bin-blink';
-      bl.style.cssText = 'left:' + (G3.hr.left - G3.gr.left + rc3.l - 1) + 'px;top:' + (G3.hr.top - G3.gr.top + rc3.t - 1) +
-        'px;width:' + (rc3.w + 2) + 'px;height:' + (rc3.h + 2) + 'px;';
-      ROOT.appendChild(bl); setTimeout(function () { bl.remove(); }, 1500);
-      showTip(tgt.t, G3.hr.left + rc3.l + 14, G3.hr.top + rc3.t + 2); tipLock = Date.now() + 5000;
-      setTimeout(function () { if (Date.now() >= tipLock) TIP.style.display = 'none'; }, 5100);
-    }, 220);
+      var G3 = readGeom(); if (!G3) return;
+      var rc = cellRect(G3, tgt.r, tgt.c), rr = rowRect(G3, tgt.r);
+      if (rc && rc.ok) {
+        blink(rc.l, rc.t, rc.w, rc.h);
+        showTip(tgt.t, G3.hr.left + rc.l + 10, G3.hr.top + rc.t + rc.h + 6, false);
+      } else if (rr.ok) {
+        blink(G3.markerW, rr.t, G3.visW - G3.markerW, rr.h);
+        showTip(tgt.t, G3.hr.left + G3.markerW + 10, G3.hr.top + rr.t + rr.h + 6, false);
+      } else if (lastClick) {
+        showTip(tgt.t, lastClick.l, lastClick.b + 6, false);
+      } else return;
+      tipLock = Date.now() + 5000;
+      setTimeout(function () { if (Date.now() >= tipLock - 50) TIP.style.display = 'none'; }, 5100);
+    }, 280);
   }
   on(doc, 'click', function (e) {
     var t = e.target && e.target.closest ? e.target.closest('.bin-goto') : null;
     if (!t) return;
+    var r = t.getBoundingClientRect(); lastClick = {l: r.left, b: r.bottom};
     gotoCell(parseInt(t.getAttribute('data-r'), 10), t.getAttribute('data-c'));
   });
   on(doc, 'mousedown', function () { tipLock = 0; TIP.style.display = 'none'; }, true);
@@ -4660,15 +4801,6 @@ _HELPER_HTML = """<script>
     var iv = W.setInterval(function () { if (m && m.scrollTop > 0) m.scrollTop = 0; if (++n > 12) W.clearInterval(iv); }, 80);
   }
   pageScroll();
-
-  var pt = W.setInterval(fitPin, 400);
-  on(W, 'resize', fitPin);
-  fitPin();
-  undo.push(function () {
-    W.clearInterval(pt);
-    if (pstyle.parentNode) pstyle.remove();
-    doc.documentElement.style.removeProperty('--bin-pin-shift');
-  });
 
   // ---- keep the events grid where it was ----
   var SEL = '.st-key-events_tbl .dvn-scroller';
@@ -5004,7 +5136,7 @@ with st.container(key="app_header"):
     _hc[2].button("↷ Redo", key="redo_btn", on_click=redo_cb, disabled=not (S.get("redo") and _on_calc),
                   help=(f"Redo — Ctrl+Y or Ctrl+Shift+Z ({len(S.get('redo', []))} step(s) available)."
                         if _on_calc else "Redo applies to the Calculator's events."), **STRETCH)
-    components.html(_HELPER_HTML, height=0)
+    inject_js(_HELPER_HTML)
     data_slot = st.empty()      # filled at the end of the run, once this run's table marks are known
 
 page = S.get("nav") or NAV_CALC
