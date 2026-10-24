@@ -49,6 +49,7 @@ TYPE_FROM_CALC = {v: k for k, v in TYPE_DISPLAY.items()}
 WASTE_TYPES = list(dict.fromkeys([
     "Cardboard", "Construction debris", "E-waste", "Green waste", "Metal", "Mixed",
     "Treated wood", "Trash", "Untreated wood", "Mixed", "Other"]))
+WASTE_BLANK = "—"      # how an empty Waste type is shown in the table's dropdown (so the grey placeholder is free for Fee basis)
 # Per-work-order billing basis (table column "Fee basis"). Blank = use the sidebar choice.
 ROW_BASIS_CHOICES = {
     "Request date": "request",
@@ -89,6 +90,7 @@ _RULE_WORD = {"ge": "on or after", "gt": "after", "eq": "the same day as"}
 # re-applied exactly. A missing key (old runs) falls back to the value shown.
 DEFAULT_OPTS = {
     "dry_resets": False,       # a dry run closes the cycle and restarts the rental term
+    "dry_fee": 0.0,            # flat fee billed for EACH Dry run row (old saved runs: 0; the sidebar starts at 100)
     "paid_governs": False,     # LEGACY (old runs): Paid date replaced Request date. Now the "Paid date" billing basis.
     "auto_bin": True,          # lock a work order to its bin when only one bin could have been on site
     "photo_on": False,         # use the Photo ID columns
@@ -503,6 +505,10 @@ def normalize_opts(o):
     for k in ("dry_resets", "paid_governs", "auto_bin", "photo_on", "photo_distinct", "row_basis_on",
               "lock_early", "wk_on", "hol_on"):
         out[k] = bool(out[k])
+    try:
+        out["dry_fee"] = max(0.0, round(float(out["dry_fee"] or 0), 2))
+    except (TypeError, ValueError):
+        out["dry_fee"] = 0.0
     return out
 
 
@@ -843,21 +849,27 @@ def free_decision_groups(events, fixed):
     return [tuple(g) for g in groups]
 
 
+def _who(e):
+    """'row 9' (table row number, when known) or the work order's label."""
+    return f"row {e['rowno']}" if e.get("rowno") else e["label"]
+
+
 def possible_bins_detail(events, fixed, delivery_dates, num_bins):
-    """idx -> (bins that CAN host the event, {bin: why not}). Only conditions that every valid scenario must
-    satisfy are used (delivered by the loaded date; pairwise order/return/repo rules against work orders already
-    locked to that bin), so a bin dropped here is truly impossible. A work order's own lock is ignored, so the
-    list shows every bin that could have served it."""
+    """idx -> (bins that CAN host the event, {bin: {"kind", "ds", "text"}} for the bins that cannot).
+    Only conditions that every valid scenario must satisfy are used (delivered by the loaded date; pairwise
+    order/return/repo rules against work orders already locked to that bin), so a bin dropped here is truly
+    impossible. A work order's own lock is ignored, so the list shows every bin that could have served it."""
     out = {}
     for i, e in enumerate(events):
         ok, why = [], {}
         for b in range(1, int(num_bins) + 1):
             ds = delivery_dates.get(b)
             if ds is None:
-                why[b] = "no delivery date"
+                why[b] = {"kind": "other", "ds": None, "text": f"Bin {b} has no delivery date."}
                 continue
             if e["loaded_date"] < ds:
-                why[b] = f"delivered {yymmdd(ds)}, after this was loaded ({yymmdd(e['loaded_date'])})"
+                why[b] = {"kind": "delivery", "ds": ds,
+                          "text": f"Bin {b} was delivered {yymmdd(ds)}, after this work order was loaded ({yymmdd(e['loaded_date'])})."}
                 continue
             bad = None
             for j, fb in fixed.items():
@@ -866,15 +878,18 @@ def possible_bins_detail(events, fixed, delivery_dates, num_bins):
                 o = events[j]
                 a, c = (o, e) if event_sort_key(o) <= event_sort_key(e) else (e, o)
                 if a["type"] == REPO:
-                    bad = (f"{a['label']} is an S/Repo on Bin {b}; {c['label']} can't follow it" if a is o
-                           else f"this is an S/Repo; {c['label']} on Bin {b} comes after it")
+                    bad = (f"{_who(o).capitalize()} is an S/Repo on Bin {b} (the rental ended there), so this work order can't "
+                           f"follow it on Bin {b}." if a is o else
+                           f"This work order is an S/Repo, but {_who(o)} (Bin {b}) comes after it.")
                     break
                 if c["loaded_date"] < a["return_date"]:
-                    bad = (f"{c['label']} was loaded {yymmdd(c['loaded_date'])}, before {a['label']}'s "
-                           f"bin was back ({yymmdd(a['return_date'])})")
+                    bad = (f"{_who(o).capitalize()} is on Bin {b} and its bin isn't back until {yymmdd(a['return_date'])}, but this "
+                           f"work order was loaded {yymmdd(c['loaded_date'])}." if a is o else
+                           f"{_who(o).capitalize()} is on Bin {b} and was loaded {yymmdd(c['loaded_date'])}, before this work "
+                           f"order's bin is back ({yymmdd(a['return_date'])}).")
                     break
             if bad:
-                why[b] = bad
+                why[b] = {"kind": "conflict", "ds": None, "text": bad}
             else:
                 ok.append(b)
         out[i] = (ok, why)
@@ -965,7 +980,7 @@ def deduplicate_scenarios(results):
 def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
                           fixed_assignments=None, num_bins=2,
                           end_basis=BASELINE_BASIS, cal=None, exempt=None,
-                          distinct_links=False, through=None):
+                          distinct_links=False, through=None, extra_fee=0):
     """Every valid way to assign the events to bins, cheapest first.
 
     Nothing is filtered here: filters are applied afterwards by filter_scenarios(),
@@ -1003,7 +1018,7 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
             fees[b], breakdowns[b] = fee_for_bin(
                 bins[b], delivery_dates.get(b), free_days, rate_per_day, end_basis, cal, through
             )
-        total = sum(fees.values())
+        total = sum(fees.values()) + extra_fee      # extra_fee = dry run fees (the same in every scenario)
         total_ext_days = sum(c["ext_days"] for bd in breakdowns.values() for c in bd)
         waived = sum(c["waived_fee"] for bd in breakdowns.values() for c in bd)
         waived_days = sum(c["waived_days"] for bd in breakdowns.values() for c in bd)
@@ -1016,6 +1031,7 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
             "fees": fees,
             "breakdowns": breakdowns,
             "total": total,
+            "extra": extra_fee,
             "total_ext_days": total_ext_days,
             "waived": waived,
             "waived_days": waived_days,
@@ -1032,11 +1048,13 @@ def run_engine(delivery_dates, free_days, rate_per_day, events, fixed, num_bins,
     The ONE place the maths is started from, so the Calculator, History, re-runs and
     reloads can never disagree about how the options are applied."""
     prep = prepare_calc(events, fixed, delivery_dates, num_bins, opts)
+    prep["dry_n"] = sum(1 for e in events if e["type"] == DRY_RUN)
+    prep["extra"] = prep["dry_n"] * prep["opts"]["dry_fee"]
     results = calculate_allocations(
         delivery_dates, free_days, rate_per_day, prep["events"], prep["fixed"], num_bins,
         end_basis=end_basis, cal=prep["cal"], exempt=prep["exempt"],
         distinct_links=prep["opts"]["photo_distinct"] and prep["opts"]["photo_on"],
-        through=through_date(prep["opts"]),
+        through=through_date(prep["opts"]), extra_fee=prep["extra"],
     )
     return results, prep
 
@@ -2142,13 +2160,14 @@ def apply_cell_edit(r, col, val, ref):
         return
     if col == COL_BIN:
         if int(S.get("num_bins_input", 2)) != 1:      # with a single bin on site there is nothing to lock
-            r["bin"] = s or "Unknown"
+            m_ = re.match(r"\s*bin\s*(\d+)", s, re.I)   # "Bin 2" or "Bin 2 (auto)" = lock to Bin 2; anything else = Unknown
+            r["bin"] = f"Bin {int(m_.group(1))}" if m_ else "Unknown"
         return
     if col == COL_BASIS:
         r["basis"] = s if s in ROW_BASIS_CHOICES else ""
         return
     if col in TEXT_FIELD:
-        r[TEXT_FIELD[col]] = s
+        r[TEXT_FIELD[col]] = "" if (col == COL_WASTE and s == WASTE_BLANK) else s
         return
     if col == COL_PAID:  # never auto-filled and never changes the other dates
         r["err"].pop(col, None)
@@ -2217,7 +2236,23 @@ def _cell_txt(r, col, field):
 
 
 def possible_info(rows):
-    """Per row: (bins that could have served it | None, tag, bin it is tied to | None).
+    """possible_info_raw() remembered for the current rows / delivery dates / options (it is asked for several
+    times per page draw: the Possible bins column, the Bin dropdown, the 'why' list, the pickers)."""
+    try:
+        key = hashlib.md5(json.dumps([state_snap()["rows"], S.get("delivery_last"), S.get("num_bins_input"),
+                                      current_opts()], sort_keys=True, default=str).encode()).hexdigest()
+    except Exception:
+        return possible_info_raw(rows)
+    hit = S.get("_pi_cache")
+    if hit and hit[0] == key:
+        return hit[1]
+    out = possible_info_raw(rows)
+    S["_pi_cache"] = (key, out)
+    return out
+
+
+def possible_info_raw(rows):
+    """Per row: (bins that could have served it | None, tag, bin it is tied to | None, why-not dict).
     Tags: locked / auto / photo / only / free / none / inert (a dry run that does not reset the term).
     Uses only conditions every valid scenario must meet, so a bin left out is truly impossible; a row's
     own lock is ignored, so the full list is always shown."""
@@ -2229,6 +2264,8 @@ def possible_info(rows):
             return out
         idxs = [i for i, r in enumerate(rows) if any(r[f] for f in DATE_FIELDS)]
         events, fixed, _ = rows_to_events([rows[i] for i in idxs])
+        for k_, ev_ in enumerate(events):
+            ev_["rowno"] = idxs[k_] + 1                    # the table row number, for the 'why' sentences
         prep = prepare_calc(events, fixed, dd, nb, current_opts())
         pm = possible_bins_detail(prep["events"], prep["fixed"], dd, nb)
         newidx = {ev["src"]: ev["idx"] for ev in prep["events"]}
@@ -2258,25 +2295,58 @@ def possible_info(rows):
 
 
 def possible_bin_texts(rows):
-    """One short text per row for the read-only 'Possible bins' column: the FULL list of bins that could
-    have served the work order, plus a note when it is locked / auto-assigned / tied by a Photo ID."""
+    """One SHORT text per row for the read-only 'Possible bins' column: the bins that could have served the work
+    order, plus (auto) / (Photo ID) / locked X. The reasons a bin is ruled out are in the 'why' list under the table."""
     texts = []
     one_bin = int(S.get("num_bins_input", 2)) == 1
     for bl, tag, fb, why in possible_info(rows):
         if tag == "inert":
-            texts.append("— (dry run: no effect)")
+            texts.append("— dry run (fee only)" if normalize_opts(current_opts())["dry_fee"] else "— dry run: no effect")
             continue
         if one_bin:                                   # only one bin on site: nothing to choose
-            texts.append("Bin 1" if bl else ("⚠ Bin 1 " + why.get(1, "") if tag else ""))
+            texts.append("Bin 1" if bl else ("⚠ not possible" if tag else ""))
             continue
-        base = ", ".join(f"Bin {b}" for b in (bl or [])) or ("⚠ none" if tag else "")
-        if tag == "only":
-            base += " only"
-        note = {"locked": f" · locked: Bin {fb}", "auto": f" · auto: Bin {fb}",
-                "photo": f" · Photo ID → Bin {fb}"}.get(tag, "")
-        why_txt = "".join(f" · ✗ Bin {b}: {w}" for b, w in sorted((why or {}).items()))
-        texts.append(base + note + why_txt)
+        if not bl:
+            texts.append("⚠ none" if tag else "")
+            continue
+        nums = ", ".join(str(b) for b in bl)
+        base = f"Bin {nums}" if len(bl) == 1 else f"Bins {nums}"
+        note = {"locked": f" · locked: Bin {fb}", "auto": " (auto)", "photo": " (Photo ID)"}.get(tag, "")
+        texts.append(base + note)
     return texts
+
+
+def auto_bin_labels(rows):
+    """Per row: 'Bin N (auto)' when the app assigned the bin itself (only one bin could have been on site, or a
+    Photo ID ties it), else ''. Shown in the Bin column instead of 'Unknown'; it is NOT a manual lock."""
+    out = []
+    for bl, tag, fb, why in possible_info(rows):
+        out.append(f"Bin {fb} (auto)" if tag in ("auto", "photo") and fb else "")
+    return out
+
+
+def show_possible_why(rows):
+    """Why some bins are ruled out, in plain sentences. Delivery-date reasons are grouped (many rows share one)."""
+    if int(S.get("num_bins_input", 2)) == 1:
+        return
+    info = possible_info(rows)
+    by_delivery, singles = {}, []
+    for i, (bl, tag, fb, why) in enumerate(info, 1):
+        if tag == "inert":
+            continue
+        for b, w in sorted((why or {}).items()):
+            if w["kind"] == "delivery":
+                by_delivery.setdefault((b, w["ds"]), []).append(i)
+            else:
+                singles.append({"Rows": str(i), "Bin ruled out": f"Bin {b}", "Why": w["text"]})
+    lines = [{"Rows": ", ".join(map(str, rs)), "Bin ruled out": f"Bin {b}",
+              "Why": f"Bin {b} was delivered {yymmdd(ds)}, after these work orders were loaded."}
+             for (b, ds), rs in sorted(by_delivery.items(), key=lambda kv: (kv[0][0], kv[0][1]))] + singles
+    if lines:
+        with st.expander(f"ℹ️ Why {len(lines)} bin choice(s) are ruled out"):
+            st.dataframe(pd.DataFrame(lines), hide_index=True, **STRETCH)
+            st.caption("Only things that are always true are used: a bin can't serve a work order loaded before the bin "
+                       "was delivered, can't be loaded again before it is back, and can't be used after an S/Repo.")
 
 
 def build_view_df(rows):
@@ -2292,12 +2362,13 @@ def build_view_df(rows):
         COL_LOADED: col([_cell_txt(r, COL_LOADED, "loaded") for r in rows]),
         COL_DISPOSAL: col([_cell_txt(r, COL_DISPOSAL, "disposal") for r in rows]),
         COL_RETURN: col([_cell_txt(r, COL_RETURN, "ret") if has_return(r["type"]) else "" for r in rows]),
-        COL_BIN: col(["Bin 1" if one_bin else r["bin"] for r in rows]),
+        COL_BIN: col(["Bin 1" if one_bin else (r["bin"] if r["bin"] != "Unknown" else (a_ or "Unknown"))
+                      for r, a_ in zip(rows, auto_bin_labels(rows))]),
         COL_POSS: col(possible_bin_texts(rows)),
         COL_PHOTO: col([r.get("link", "") for r in rows]),
         COL_PHOTO2: col([r.get("link2", "") for r in rows]),
         COL_BASIS: col([r.get("basis", "") for r in rows]),
-        COL_WASTE: col([r.get("waste", "") for r in rows]),
+        COL_WASTE: col([r.get("waste", "") or WASTE_BLANK for r in rows]),
         COL_REMARKS: col([r.get("remarks", "") for r in rows]),
     })[TBL_COLS]
     df[COL_DISP_PIN] = df[COL_DISPOSAL]          # display-only copy (never read back into the rows)
@@ -2426,7 +2497,7 @@ def holiday_table():
 def current_opts():
     """The calculation options as currently set in the sidebar (normalised)."""
     return normalize_opts({
-        "dry_resets": S.get("opt_dry_resets"), "paid_governs": False,
+        "dry_resets": S.get("opt_dry_resets"), "paid_governs": False, "dry_fee": S.get("opt_dry_fee"),
         "auto_bin": S.get("opt_auto_bin"), "photo_on": S.get("opt_photo_on"),
         "photo_distinct": S.get("opt_photo_distinct"), "row_basis_on": S.get("opt_row_basis"),
         "cycle_start": S.get("opt_cycle_start"), "lock_early": S.get("opt_lock_early"),
@@ -2480,7 +2551,7 @@ def set_opts_widgets(o):
     """Push saved calculation options into the sidebar widgets (callbacks / restore only,
     i.e. before those widgets are drawn)."""
     o = normalize_opts(o)
-    S["opt_dry_resets"], S["opt_auto_bin"] = o["dry_resets"], o["auto_bin"]
+    S["opt_dry_resets"], S["opt_auto_bin"], S["opt_dry_fee"] = o["dry_resets"], o["auto_bin"], o["dry_fee"]
     S["opt_photo_on"], S["opt_photo_distinct"], S["opt_row_basis"] = o["photo_on"], o["photo_distinct"], o["row_basis_on"]
     S["opt_cycle_start"], S["opt_waive_mode"], S["opt_lock_early"] = o["cycle_start"], o["waive_mode"], o["lock_early"]
     S["opt_through_on"] = bool(o["through"])
@@ -2496,7 +2567,7 @@ def table_ctx_sig():
     grid is re-drawn (a data_editor cannot change its columns without losing edits)."""
     dd = S.get("delivery_last") or {}
     return json.dumps([sorted((int(b), str(d)) for b, d in dd.items()), S.get("num_bins_input"),
-                       current_opts(), visible_cols(), S.get("date_cells"), frozen_cols()],
+                       current_opts(), visible_cols(), S.get("date_cells"), frozen_cols(), S.get("basis_choice")],
                       sort_keys=True, default=str)
 
 
@@ -2908,12 +2979,28 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False):
     for c in [c for c in df.columns if c.endswith("Fee") or c in ("Total", "Waived", "Weekend/holiday waived")]:
         if (df[c] % 1 == 0).all():      # whole dollars: show $3,000, not $3,000.00
             df[c] = df[c].astype(int)
+    df.attrs["pinned_bins"] = sorted(pin_plan)
     return df, cfg
 
 
 def show_scenario_table(results, num_bins, show_days, show_cal=False):
     df, cfg = build_scenario_table(results, num_bins, show_days, show_cal)
-    st.dataframe(df, hide_index=True, column_config=cfg, **STRETCH)
+    data = df
+    try:
+        # Streamlit draws a frozen column's text in a lighter grey than the other columns, so Bin 1 looked grey and Bin 2
+        # looked bold. Give the Bin columns that are NOT frozen the same grey so they all look alike.
+        pinned = df.attrs.get("pinned_bins") or []
+        loose = [f"Bin {b}" for b in range(1, int(num_bins) + 1) if b not in pinned]
+        try:
+            dark = st.context.theme.type == "dark"
+        except Exception:
+            dark = False
+        if pinned and loose and not dark:
+            sty = df.style
+            data = (getattr(sty, "map", None) or sty.applymap)(lambda v: "color: #83858c", subset=loose)
+    except Exception:
+        data = df
+    st.dataframe(data, hide_index=True, column_config=cfg, **STRETCH)
 
 
 def options_summary(opts, n_dry=0):
@@ -2922,7 +3009,9 @@ def options_summary(opts, n_dry=0):
     out = []
     if n_dry:
         out.append("dry runs reset the rental term" if o["dry_resets"]
-                   else f"{n_dry} dry run(s) listed but not billed (they do not reset the term)")
+                   else f"{n_dry} dry run(s) do not reset the rental term")
+        if o["dry_fee"]:
+            out.append(f"dry run fee ${o['dry_fee']:,.0f} each × {n_dry} = ${o['dry_fee'] * n_dry:,.0f} (in every total)")
     if o["row_basis_on"]:
         out.append("billing basis chosen per work order")
     if o["photo_on"]:
@@ -3062,8 +3151,7 @@ def render_results(cached, filters, show_tree, show_days, show_timeline, interch
                f"{CYCLE_STARTS[_o['cycle_start']]}; each cycle ends on the {BASIS_LABEL.get(end_basis, end_basis).lower()} "
                "(unless a work order has its own Fee basis).")
     cal = cached.get("cal")
-    summary = options_summary(cached.get("opts"), len(cached.get("inert") or []) +
-                              sum(1 for e in events if e["type"] == DRY_RUN))
+    summary = options_summary(cached.get("opts"), cached.get("dry_n", 0))
     if summary:
         st.caption("⚙️ Options in effect: " + "; ".join(summary) + ".")
     if cached.get("auto"):
@@ -3179,6 +3267,9 @@ def render_results(cached, filters, show_tree, show_days, show_timeline, interch
                     )
                 st.write(line)
 
+    if cached.get("extra_fee"):
+        st.write(f"**Dry run fees:** {cached.get('dry_n', 0)} × \\${normalize_opts(cached.get('opts'))['dry_fee']:,.0f} = "
+                 f"**\\${cached['extra_fee']:,.0f}** — included in every scenario's total above.")
     info = cached.get("saved_msg")
     if info:
         st.info(info)
@@ -3449,10 +3540,44 @@ def table_tips():
             "basis is required; clear any cell you don't need.")
 
 
+def placeholder_kw(calendar_mode):
+    """Empty Fee basis cells show the sidebar billing basis in grey ('Request date (default)'): the editor's
+    placeholder text is what Streamlit draws, in grey, for an empty cell of a dropdown column. Not used in calendar mode
+    (empty date cells would show it too) or on a Streamlit without the option."""
+    try:
+        if (COL_BASIS in visible_cols() and not calendar_mode
+                and "placeholder" in inspect.signature(st.data_editor).parameters):
+            return {"placeholder": f"{S.get('basis_choice', 'Request date')} (default)"}
+    except Exception:
+        pass
+    return {}
+
+
+def table_bin_options(num_bins):
+    """Choices for the Bin column. A Streamlit table column has ONE list for all rows, so it offers the bins that were
+    possible for at least one row (plus 'Unknown', and any value already in the table). A bin that was impossible for
+    every row is left out unless 'Allow a bin lock before that bin's delivery date' is on. Per-row filtering is in the
+    Individual pickers view; a choice that is impossible for its own row is reported as an error."""
+    if int(num_bins) == 1:
+        return ["Bin 1"]
+    info = possible_info(S["rows"])
+    possible = {b for bl, tag, fb, why in info for b in (bl or [])}
+    opts = ["Unknown"]
+    for b in range(1, int(num_bins) + 1):
+        if b in possible or S.get("opt_lock_early") or not possible:
+            opts.append(f"Bin {b}")
+    base = S.get("tbl_base")
+    if base is not None and COL_BIN in base.columns:       # a value already in the grid must stay selectable
+        for v in base[COL_BIN].tolist():
+            if isinstance(v, str) and v and v not in opts:
+                opts.append(v)
+    return opts
+
+
 def render_table_mode(num_bins):
     ensure_table_fresh()
     one_bin = int(num_bins) == 1
-    bin_options = ["Bin 1"] if one_bin else ["Unknown"] + [f"Bin {b + 1}" for b in range(int(num_bins))]
+    bin_options = table_bin_options(num_bins)
     type_options = list(TYPE_DISPLAY.keys())
     cal = S.get("date_cells") == "calendar"
     pins = set(frozen_cols())
@@ -3474,6 +3599,7 @@ def render_table_mode(num_bins):
             hide_index=True,
             height=tbl_height(len(S["rows"])),
             column_order=visible_cols(),
+            **placeholder_kw(cal),
             disabled=[COL_NO, COL_POSS, COL_DISP_PIN, COL_CHECK],
             column_config={
                 COL_NO: _cc("TextColumn", "No", align="center", width="small", pinned=(COL_NO in pins)),
@@ -3488,7 +3614,8 @@ def render_table_mode(num_bins):
                 COL_TYPE: cfg_for(COL_TYPE, "SelectboxColumn",
                                   help="S/Rtn = service & return (bin comes back) · S/Repo = rental ends (no return "
                                        "date) · S/Swap = empty bin dropped, full bin loaded · Dry run = truck went, "
-                                       "nothing loaded (see the sidebar for whether it resets the rental term)",
+                                       "nothing loaded (charged the sidebar's Dry run fee; the sidebar also says whether "
+                                       "it resets the rental term)",
                                   options=type_options, required=True, default="S/Rtn", width="small"),
                 COL_REQUEST: date_col(COL_REQUEST, help="Date the customer asked for service."),
                 COL_PAID: date_col(COL_PAID, help="Date the request was paid. Used when the billing basis is "
@@ -3518,11 +3645,12 @@ def render_table_mode(num_bins):
                                          "a different ID, or the word “different” if you don't know its ID = another unit. "
                                          "Type the same ID on the later work order that picks that bin up to tie them."),
                 COL_BASIS: cfg_for(COL_BASIS, "SelectboxColumn",
-                                   help="Optional. Use a different date to end THIS work order's cycle. "
-                                        "Blank = the sidebar billing basis.",
-                                   options=list(ROW_BASIS_CHOICES), required=False),
+                                   help="Optional. Use a different date to end THIS work order's cycle. The grey text is "
+                                        "the sidebar billing basis, which every work order uses unless you pick another "
+                                        "here (Delete puts it back).",
+                                   options=list(ROW_BASIS_CHOICES), required=False, width=175),
                 COL_WASTE: cfg_for(COL_WASTE, "SelectboxColumn", help="For the audit trail only; not used in the fee maths.",
-                                   options=WASTE_TYPES, required=False, width="small"),
+                                   options=[WASTE_BLANK] + WASTE_TYPES, required=False, width="small"),
                 COL_REMARKS: cfg_for(COL_REMARKS, "TextColumn", help="For the audit trail only; not used in the fee maths.",
                                      width="medium"),
             },
@@ -3642,7 +3770,8 @@ def render_picker_mode(num_bins):
                                    "the same unit came back; another ID, or “different”, = another unit.")
         with c2[4]:
             if opts["row_basis_on"]:
-                st.selectbox("Fee basis", list(ROW_BASIS_CHOICES), index=None, key=k("basis"), placeholder="(sidebar)",
+                st.selectbox("Fee basis", list(ROW_BASIS_CHOICES), index=None, key=k("basis"),
+                             placeholder=f"{S.get('basis_choice', 'Request date')} (default)",
                              on_change=on_picker_change, args=(uid, "basis", v))
         st.divider()
     if not rows:
@@ -3759,6 +3888,7 @@ def events_panel(num_bins, end_basis):
     for msg in S.pop("_flash_notices", []):
         st.info(msg)
     render_issues(validate_issues(S["rows"], int(num_bins), end_basis, current_opts(), S.get("delivery_last")))
+    show_possible_why(S["rows"])
     if current_opts()["photo_on"]:
         show_photo_report(S["rows"])
     pool = [effective_dates(r) for r in S["rows"] if any(r[f] for f in DATE_FIELDS)]
@@ -3782,6 +3912,7 @@ def snapshot_from_run(prep, all_results, delivery_dates, free_days, rate, num_bi
         "fixed": dict(prep["fixed"]), "exempt": set(prep["exempt"]), "auto": set(prep["auto"]),
         "user": set(prep["user"]),
         "inert": list(prep["inert"]), "opts": prep["opts"], "cal": prep["cal"],
+        "extra_fee": prep.get("extra", 0), "dry_n": prep.get("dry_n", 0),
         "free_days": free_days, "rate": rate,
         "end_basis": end_basis, "saved_msg": saved_msg,
     }
@@ -3793,7 +3924,7 @@ def _recalc_cached(cached, end_basis):
         cached["delivery_dates"], cached["free_days"], cached["rate"], cached["events"],
         cached["fixed"], cached["num_bins"], end_basis=end_basis, cal=cached.get("cal"),
         exempt=cached.get("exempt"), distinct_links=o["photo_distinct"] and o["photo_on"],
-        through=through_date(o),
+        through=through_date(o), extra_fee=cached.get("extra_fee", 0),
     )
 
 
@@ -4094,7 +4225,7 @@ def init_state():
     d("input_mode", TABLE_MODE)
     d("undo", [])
     d("redo", [])
-    for k, v in (("opt_dry_resets", False), ("opt_auto_bin", True), ("opt_lock_early", False),
+    for k, v in (("opt_dry_resets", False), ("opt_dry_fee", 100.0), ("opt_auto_bin", True), ("opt_lock_early", False),
                  ("opt_photo_on", False), ("opt_photo_distinct", False), ("opt_row_basis", False),
                  ("opt_cycle_start", DEFAULT_OPTS["cycle_start"]), ("opt_through_on", False),
                  ("opt_through", _month_end(today_guam())), ("f_bal_mode", "qty"), ("f_bal_pct", 25),
@@ -4157,6 +4288,9 @@ def inject_css():
         }}
         .st-key-app_header [data-testid="stRadio"] label:has(input:checked) p {{ color: #fff; font-weight: 600; }}
         [data-testid="stTooltipContent"] {{ max-width: min(22rem, 88vw) !important; }}
+        /* the real "Pin sidebar" switch is driven by the floating 📌 button */
+        .st-key-pin_sidebar {{ position: fixed !important; left: -9999px; top: 0; width: 1px; height: 1px;
+                               overflow: hidden; opacity: 0; }}
         </style>""",
         unsafe_allow_html=True,
     )
@@ -4193,6 +4327,56 @@ _HELPER_HTML = """<script>
     if (!btn) return;
     e.preventDefault();
     if (!btn.disabled) btn.click();
+  }, true);
+
+  // ---- the 📌 button: always visible, sits where the sidebar's open / close button is ----
+  var PIN0 = "__PIN__" === "1";
+  var pbtn = doc.getElementById('bin-pin-btn');
+  if (pbtn) pbtn.remove();
+  pbtn = doc.createElement('button');
+  pbtn.id = 'bin-pin-btn'; pbtn.type = 'button'; pbtn.textContent = '📌';
+  pbtn.setAttribute('aria-pressed', PIN0 ? 'true' : 'false');
+  pbtn.title = PIN0 ? 'Sidebar pinned open — click to unpin'
+                    : 'Pin the sidebar open (the page moves over so the sidebar never covers it)';
+  pbtn.style.cssText = 'position:fixed;z-index:1000002;top:14px;left:56px;width:30px;height:28px;padding:0;' +
+    'border-radius:6px;cursor:pointer;font-size:15px;line-height:1;' +
+    (PIN0 ? 'background:#ff4b4b;border:1px solid #ff4b4b;color:#fff;'
+          : 'background:rgba(128,128,128,.18);border:1px solid rgba(128,128,128,.55);color:inherit;');
+  pbtn.onclick = function () {
+    var lab = doc.querySelector('.st-key-pin_sidebar label');
+    if (lab) lab.click();
+  };
+  doc.body.appendChild(pbtn);
+  function placePin() {
+    var sb = doc.querySelector('[data-testid="stSidebar"]'), left = 56, top = 14;
+    if (sb && sb.getAttribute('aria-expanded') !== 'false') {
+      left = Math.round(sb.getBoundingClientRect().right) - 78;          // beside the sidebar's « button
+    } else {
+      var ex = doc.querySelector('[data-testid="stExpandSidebarButton"]');   // right of the » button
+      if (ex) { var r = ex.getBoundingClientRect(); if (r.width) { left = Math.round(r.right) + 6; top = Math.round(r.top + (r.height - 28) / 2); } }
+    }
+    pbtn.style.left = Math.max(4, left) + 'px'; pbtn.style.top = Math.max(4, top) + 'px';
+  }
+  var ppt = W.setInterval(placePin, 300);
+  on(W, 'resize', placePin);
+  placePin();
+  undo.push(function () { W.clearInterval(ppt); if (pbtn) pbtn.remove(); });
+
+  // ---- a dropdown opened inside the table must not float in place when the page scrolls: close it ----
+  var ovSeen = null, ovT = 0;
+  var mo2 = new W.MutationObserver(function () {
+    var ov = doc.querySelector('#portal .gdg-clip-region');
+    if (!ov) { ovSeen = null; } else if (ov !== ovSeen) { ovSeen = ov; ovT = Date.now(); }
+  });
+  mo2.observe(doc.body, {childList: true, subtree: true});
+  undo.push(function () { mo2.disconnect(); });
+  on(doc, 'scroll', function (e) {
+    var ov = doc.querySelector('#portal .gdg-clip-region');
+    if (!ov || Date.now() - ovT < 400) return;                // (the editor may scroll its own cell into view as it opens)
+    var t = e.target;
+    if (t && t.nodeType === 1 && ov.contains(t)) return;      // scrolling inside the dropdown's own list is fine
+    var a = doc.activeElement || doc.body;
+    a.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true}));
   }, true);
 
   // ---- pinned sidebar: stay open, and move the page over by however much the sidebar covers it ----
@@ -4351,6 +4535,7 @@ _SETTING_CHECKS = {
     "delivery_single": lambda v: isinstance(v, date),
     "input_mode": _ok_choice([TABLE_MODE, PICKER_MODE]),
     "opt_dry_resets": _ok_bool, "opt_auto_bin": _ok_bool, "opt_lock_early": _ok_bool,
+    "opt_dry_fee": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 100000,
     "opt_photo_on": _ok_bool, "opt_photo_distinct": _ok_bool, "opt_row_basis": _ok_bool,
     "opt_cycle_start": _ok_choice(list(CYCLE_STARTS)), "opt_waive_mode": _ok_choice(list(WAIVE_MODES)),
     "opt_through_on": _ok_bool, "opt_through": lambda v: isinstance(v, date),
@@ -4548,17 +4733,18 @@ with st.container(key="app_header"):
 
     # A horizontal radio styled as tabs: its value lives in session_state, so any button
     # can switch pages from Python (no browser scripting).
-    _hc = st.columns([5.2, 1.7, 1.25, 1.25], vertical_alignment="center")
+    _hc = st.columns([6.9, 1.25, 1.25], vertical_alignment="center")
     _hc[0].radio("Page", [NAV_CALC, NAV_HIST], key="nav", horizontal=True, label_visibility="collapsed")
-    _hc[1].checkbox("📌 Pin sidebar", key="pin_sidebar",
-                    help="Keeps the sidebar open and moves the page over so the sidebar never covers it (on narrow "
-                         "windows Streamlit otherwise floats the sidebar over the page).")
+    # The "Pin sidebar" switch itself is hidden (CSS) and is clicked by the 📌 button that sits next to the sidebar's
+    # open / close button and stays visible while you scroll (see _HELPER_HTML).
+    st.checkbox("📌 Pin sidebar", key="pin_sidebar",
+                help="Keeps the sidebar open and moves the page over so the sidebar never covers it.")
     # Undo / redo for the events (also Ctrl+Z / Ctrl+Y, wired up by the helper script below).
     _on_calc = (S.get("nav") or NAV_CALC) == NAV_CALC
-    _hc[2].button("↶ Undo", key="undo_btn", on_click=undo_cb, disabled=not (S.get("undo") and _on_calc),
+    _hc[1].button("↶ Undo", key="undo_btn", on_click=undo_cb, disabled=not (S.get("undo") and _on_calc),
                   help=(f"Undo the last change to the events — Ctrl+Z ({len(S.get('undo', []))} step(s) available)."
                         if _on_calc else "Undo applies to the Calculator's events."), **STRETCH)
-    _hc[3].button("↷ Redo", key="redo_btn", on_click=redo_cb, disabled=not (S.get("redo") and _on_calc),
+    _hc[2].button("↷ Redo", key="redo_btn", on_click=redo_cb, disabled=not (S.get("redo") and _on_calc),
                   help=(f"Redo — Ctrl+Y or Ctrl+Shift+Z ({len(S.get('redo', []))} step(s) available)."
                         if _on_calc else "Redo applies to the Calculator's events."), **STRETCH)
     components.html(_HELPER_HTML.replace("__PIN__", "1" if S.get("pin_sidebar") else "0"), height=0)
@@ -4665,6 +4851,10 @@ with st.sidebar:
     st.checkbox("🚚 Dry run resets the rental term", key="opt_dry_resets",
                 help="On: a Dry run closes the current cycle on its date and the next cycle (and free days) "
                      "starts that day, like a service. Off: a Dry run is listed but has no effect on fees.")
+    st.number_input("Dry run fee ($ each)", min_value=0.0, step=10.0, format="%.2f", key="opt_dry_fee",
+                    help="A flat fee billed for EVERY work order whose Type is Dry run (the truck went but nothing was "
+                         "loaded), whether or not a dry run resets the rental term. It is added to every scenario's "
+                         "total. Set 0 for no charge. Runs saved before this option existed keep a $0 fee.")
     st.checkbox("📅 Also bill bins still on site through a date", key="opt_through_on",
                 help="For month-end billing: a bin that is still on site after its last work order keeps running until "
                      "this date (a bin with no work orders runs from its delivery date). Leave off to bill only up to "
