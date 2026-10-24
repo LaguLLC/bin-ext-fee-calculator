@@ -1,5 +1,6 @@
 import difflib
 import hashlib
+import html as _html
 import inspect
 import json
 import os
@@ -49,6 +50,8 @@ TYPE_FROM_CALC = {v: k for k, v in TYPE_DISPLAY.items()}
 WASTE_TYPES = list(dict.fromkeys([
     "Cardboard", "Construction debris", "E-waste", "Green waste", "Metal", "Mixed",
     "Treated wood", "Trash", "Untreated wood", "Mixed", "Other"]))
+EXT_TOTAL = "Extension total"            # scenario-table column names used when a dry run fee is in play
+GRAND_TOTAL = "Total incl. dry runs"
 WASTE_BLANK = "—"      # how an empty Waste type is shown in the table's dropdown (so the grey placeholder is free for Fee basis)
 # Per-work-order billing basis (table column "Fee basis"). Blank = use the sidebar choice.
 ROW_BASIS_CHOICES = {
@@ -1018,7 +1021,7 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
             fees[b], breakdowns[b] = fee_for_bin(
                 bins[b], delivery_dates.get(b), free_days, rate_per_day, end_basis, cal, through
             )
-        total = sum(fees.values()) + extra_fee      # extra_fee = dry run fees (the same in every scenario)
+        total = sum(fees.values())                  # extension fees only; dry run fees are kept apart (extra / grand)
         total_ext_days = sum(c["ext_days"] for bd in breakdowns.values() for c in bd)
         waived = sum(c["waived_fee"] for bd in breakdowns.values() for c in bd)
         waived_days = sum(c["waived_days"] for bd in breakdowns.values() for c in bd)
@@ -1032,6 +1035,7 @@ def calculate_allocations(delivery_dates, free_days, rate_per_day, events,
             "breakdowns": breakdowns,
             "total": total,
             "extra": extra_fee,
+            "grand": total + extra_fee,
             "total_ext_days": total_ext_days,
             "waived": waived,
             "waived_days": waived_days,
@@ -1507,8 +1511,10 @@ def _add_to_history_locked(customer, version, delivery_dates, events, results,
                 "blank": list(blanks.get(i, [])),  # cells the user left empty
             } for i, e in enumerate(events)
         ],
-        "min_total": results[0]["total"] if results else 0,
+        "min_total": results[0]["total"] if results else 0,        # extension fees only
         "max_total": results[-1]["total"] if results else 0,
+        "dry_total": results[0].get("extra", 0) if results else 0,  # dry run fees, kept apart from the totals
+        "totals_ex_dry": True,
         "min_ext_days": min_ext,
         "max_ext_days": max_ext,
         "scenario_count": len(results),
@@ -1518,6 +1524,21 @@ def _add_to_history_locked(customer, version, delivery_dates, events, results,
     history.append(rec)
     save_history(history)
     return rec
+
+
+def rec_dry_total(rec):
+    """Dry run fees of a saved run (older runs: worked out from their options and dry-run rows)."""
+    if "dry_total" in rec:
+        return float(rec.get("dry_total") or 0)
+    n = sum(1 for e in rec.get("events", []) if e.get("type") == DRY_RUN)
+    return n * normalize_opts(rec.get("options"))["dry_fee"]
+
+
+def rec_ext_total(rec, key):
+    """min_total / max_total of a saved run WITHOUT dry run fees. The build that first charged a dry run fee folded it
+    into these two numbers; those runs are recognised by the missing 'totals_ex_dry' flag and corrected here."""
+    v = float(rec.get(key, 0) or 0)
+    return v if rec.get("totals_ex_dry") else v - rec_dry_total(rec)
 
 
 def delete_history_records(ids):
@@ -1657,14 +1678,13 @@ COL_PHOTO2 = "Photo ID (dropped)"
 COL_BASIS = "Fee basis"
 COL_WASTE = "Waste type"
 COL_REMARKS = "Remarks"
-COL_CHECK = "Check"                  # read-only: what is wrong with the row / which dates are auto-filled
 COL_DISP_PIN = "Disposal (frozen)"   # read-only copy of Disposal date, pinned at the left (see build_view_df)
 # Chronological left to right; Type first because it decides whether Return exists.
 # TBL_COLS is every column the table holds. Which ones are SHOWN, and in what order, is
 # decided by visible_cols(); a hidden column keeps its data (it is only left out of column_order).
-TBL_COLS = [COL_NO, COL_CHECK, COL_TYPE, COL_REQUEST, COL_PAID, COL_LOADED, COL_DISPOSAL, COL_RETURN,
+TBL_COLS = [COL_NO, COL_TYPE, COL_REQUEST, COL_PAID, COL_LOADED, COL_DISPOSAL, COL_RETURN,
             COL_BIN, COL_POSS, COL_PHOTO, COL_PHOTO2, COL_BASIS, COL_WASTE, COL_REMARKS]
-EDIT_COLS = [c for c in TBL_COLS if c not in (COL_NO, COL_POSS, COL_CHECK)]   # POSS and CHECK are computed
+EDIT_COLS = [c for c in TBL_COLS if c not in (COL_NO, COL_POSS)]   # COL_POSS is computed
 _DATE_FIELD = {COL_REQUEST: "request", COL_LOADED: "loaded", COL_DISPOSAL: "disposal", COL_RETURN: "ret"}
 DATE_FIELDS = ("request", "loaded", "disposal", "ret")   # Paid is deliberately NOT here: it is never auto-filled
 DATE_COLS = (COL_REQUEST, COL_PAID, COL_LOADED, COL_DISPOSAL, COL_RETURN)
@@ -2022,48 +2042,70 @@ def validate_rows(rows, num_bins, basis, opts=None, delivery_dates=None, rules=N
     return errors, warns
 
 
-def row_checks(rows):
-    """One short text per row for the read-only Check column: what blocks the row, what to look at, or which
-    cells are pre-filled (they follow the dates you typed until you type them yourself)."""
-    try:
-        basis = BASIS_CHOICES.get(S.get("basis_choice"), "request")
-        issues = validate_issues(rows, int(S.get("num_bins_input", 2)), basis, current_opts(), S.get("delivery_last"))
-    except Exception:
-        issues = []
-    per = {}
-    for x in issues:
-        if x["row"]:
-            per.setdefault(x["row"], []).append(x)
-    names = {"request": "Request", "loaded": "Loaded", "disposal": "Disposal", "ret": "Return"}
-    out = []
-    for i, r in enumerate(rows, 1):
-        xs = per.get(i, [])
-        errs = [x["short"] for x in xs if x["level"] == "error"]
-        warns = [x["short"] for x in xs if x["level"] == "warning"]
-        if errs:
-            out.append("⚠ " + "; ".join(errs))
-        elif warns:
-            out.append("△ " + "; ".join(warns))
-        elif r.get("ph"):
-            out.append("demo row")
-        elif r.get("auto"):
-            out.append("↻ pre-filled: " + ", ".join(names[f] for f in DATE_FIELDS if f in r["auto"]))
-        else:
-            out.append("")
-    return out
-
-
 def render_issues(issues):
-    """The blocking problems (one line each: row, column, what is wrong) and the warnings."""
+    """The blocking problems as a red box with one clickable line each (a click jumps to the cell and blinks it),
+    then the warnings."""
     errs = [x for x in issues if x["level"] == "error"]
     if errs:
-        rows_hit = sorted({x["row"] for x in errs if x["row"]})
-        where = ("row " if len(rows_hit) == 1 else "rows ") + ", ".join(map(str, rows_hit)) if rows_hit else "see below"
-        st.error(f"⚠️ **{len(errs)} problem(s) block Calculate** ({where}). The **Check** column marks each row.\n\n"
-                 + "\n".join(f"- **{('Row ' + str(x['row']) + ' · ') if x['row'] else ''}{x['col']}** — {x['text']}" for x in errs))
+        items = []
+        for x in errs:
+            label = (f"Row {x['row']} · " if x["row"] else "") + x["col"]
+            if x["row"]:
+                head = (f'<span class="bin-goto" data-r="{x["row"]}" data-c="{_html.escape(x["col"], quote=True)}" '
+                        f'title="Click to jump to this cell">{_html.escape(label)}</span>')
+            else:
+                head = f"<b>{_html.escape(label)}</b>"
+            items.append(f"<li>{head} — {_html.escape(x['text'])}</li>")
+        st.markdown(
+            f'<div class="bin-err-box"><b>⚠️ {len(errs)} problem(s) block Calculate.</b> '
+            "Click a row/column below to jump to the cell (it is also filled red in the table; hover it for the reason)."
+            f'<ul>{"".join(items)}</ul></div>', unsafe_allow_html=True)
     for x in issues:
         if x["level"] == "warning":
             st.warning((f"Row {x['row']} · " if x["row"] else "") + x["text"])
+
+
+def grid_marks(rows, issues):
+    """Cells to draw over the table: blocking problems (red) and pre-filled dates (light blue), each with a tooltip.
+    -> list of {"r": row number, "c": column name, "k": "err" | "auto", "t": text}."""
+    vis = visible_cols()
+    cells = []
+    auto_tip = ("Pre-filled for you. It follows the dates you typed until you type this cell yourself "
+                "(or press “Keep pre-filled dates”).")
+    for i, r in enumerate(rows, 1):
+        if r.get("ph"):
+            continue
+        for f in r.get("auto", ()):
+            col = FIELD_COL.get(f)
+            if col in vis:
+                cells.append({"r": i, "c": col, "k": "auto", "t": auto_tip})
+                if col == COL_DISPOSAL and COL_DISP_PIN in vis:
+                    cells.append({"r": i, "c": COL_DISP_PIN, "k": "auto", "t": auto_tip})
+    for x in issues:
+        if x["level"] != "error" or not x["row"]:
+            continue
+        col = x["col"]
+        if col not in vis:                          # e.g. "(whole row)", or a column that is hidden
+            col = next((c for c in vis if c not in (COL_NO, COL_DISP_PIN)), vis[0])
+        for c in ([col] + ([COL_DISP_PIN] if col == COL_DISPOSAL and COL_DISP_PIN in vis else [])):
+            cells.append({"r": x["row"], "c": c, "k": "err", "t": x["text"]})
+    return cells
+
+
+_DATA_HTML = """<script>
+(function () {
+  var W = window.parent;
+  W._binData = __DATA__;
+  try { W.dispatchEvent(new W.CustomEvent('bin-data')); } catch (e) {}
+})();
+</script>"""
+
+
+def publish_page_data(page, cells, layout):
+    """Hand the table marks / page name to the helper script in the browser (a tiny invisible iframe)."""
+    blob = json.dumps({"page": page, "cells": cells, "layout": layout,
+                       "top": bool(S.pop("_scroll_top_once", False))}, separators=(",", ":"))
+    components.html(_DATA_HTML.replace("__DATA__", blob.replace("</", "<\\/")), height=0)
 
 
 def rows_to_events(rows):
@@ -2355,7 +2397,6 @@ def build_view_df(rows):
     one_bin = int(S.get("num_bins_input", 2)) == 1
     df = pd.DataFrame({
         COL_NO: col([str(i) for i in range(1, len(rows) + 1)]),
-        COL_CHECK: col(row_checks(rows)),
         COL_TYPE: col([r["type"] for r in rows]),
         COL_REQUEST: col([_cell_txt(r, COL_REQUEST, "request") for r in rows]),
         COL_PAID: col([_cell_txt(r, COL_PAID, "paid") for r in rows]),
@@ -2416,8 +2457,15 @@ def on_table_edit():
         pos = int(pos_s)
         if 0 <= pos < len(eff):
             for col, val in changes.items():
-                if col in EDIT_COLS:
+                if col in EDIT_COLS or col == COL_DISP_PIN:
                     eff.at[pos, col] = "" if val is None else str(val)
+    # The frozen copy of Disposal date is editable too: typing in it is the same as typing in the real column
+    # (unless the real column was edited in the same step, which then wins).
+    if COL_DISP_PIN in eff.columns and COL_DISP_PIN in seen.columns:
+        for pos in range(len(eff)):
+            if (_norm_cell(eff.at[pos, COL_DISP_PIN]) != _norm_cell(seen.at[pos, COL_DISP_PIN])
+                    and _norm_cell(eff.at[pos, COL_DISPOSAL]) == _norm_cell(seen.at[pos, COL_DISPOSAL])):
+                eff.at[pos, COL_DISPOSAL] = eff.at[pos, COL_DISP_PIN]
 
     # 1. cells changed since the last time this callback ran
     changed = {}
@@ -2437,6 +2485,9 @@ def on_table_edit():
     # 2. rows added by pasting past the end / the + row
     new_rows = []
     for item in added:
+        item = dict(item)
+        if not str(item.get(COL_DISPOSAL) or "").strip() and str(item.get(COL_DISP_PIN) or "").strip():
+            item[COL_DISPOSAL] = item[COL_DISP_PIN]          # pasted / typed into the frozen copy of Disposal date
         r = new_row()
         ref = new_rows[-1]["disposal"] if new_rows and new_rows[-1]["disposal"] else (
             _ref_for_row(rows + new_rows, len(rows) + len(new_rows)))
@@ -2524,11 +2575,8 @@ def visible_cols():
         hidden.add(COL_REMARKS)
     if not S.get("col_poss", True):
         hidden.add(COL_POSS)
-    if not S.get("col_check", True):
-        hidden.add(COL_CHECK)
     order = [c for c in S.get("col_order", TBL_COLS) if c in TBL_COLS and c != COL_NO]
-    missing = [c for c in TBL_COLS if c != COL_NO and c not in order]      # e.g. a column added by a newer version
-    order = [c for c in missing if c == COL_CHECK] + order + [c for c in missing if c != COL_CHECK]
+    order += [c for c in TBL_COLS if c != COL_NO and c not in order]      # e.g. a column added by a newer version
     head = [COL_NO] + ([COL_DISP_PIN] if S.get("pin_disp_copy", True) else [])
     return head + [c for c in order if c not in hidden]
 
@@ -2536,6 +2584,21 @@ def visible_cols():
 def data_cols():
     """The real, reorderable data columns (not the row number, not the frozen copy)."""
     return [c for c in visible_cols() if c not in (COL_NO, COL_DISP_PIN)]
+
+
+# Pixel widths of the table's columns. Fixed (instead of auto-sized) so the red / blue marks drawn over the table
+# line up exactly; a column you drag wider is noticed (the marks hide) until the table is next re-drawn.
+COL_WIDTHS = {COL_NO: 56, COL_DISP_PIN: 112, COL_TYPE: 72, COL_REQUEST: 92, COL_PAID: 92, COL_LOADED: 92,
+              COL_DISPOSAL: 92, COL_RETURN: 92, COL_BIN: 104, COL_POSS: 190, COL_PHOTO: 132, COL_PHOTO2: 132,
+              COL_BASIS: 172, COL_WASTE: 112, COL_REMARKS: 220}
+
+
+def grid_layout():
+    """Columns in the order the table draws them (frozen ones first) with their pixel widths."""
+    vis = visible_cols()
+    pins = set(frozen_cols())
+    ordered = [c for c in vis if c in pins] + [c for c in vis if c not in pins]
+    return [{"c": c, "w": COL_WIDTHS.get(c, 100), "p": c in pins} for c in ordered]
 
 
 def frozen_cols():
@@ -2932,7 +2995,7 @@ def _bin_pin_plan(text_len, budget=330, no_w=50):
     return plan
 
 
-def build_scenario_table(results, num_bins, show_days, show_cal=False):
+def build_scenario_table(results, num_bins, show_days, show_cal=False, show_dry=False):
     """Numeric columns (so sorting by Total puts $250 before $300 before $3,000)
     plus the column_config that formats them."""
     nb = int(num_bins)
@@ -2945,7 +3008,7 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False):
             row[f"Bin {b} Fee"] = float(r["fees"][b])
             if show_days:
                 row[f"Bin {b} Days"] = int(sum(c["ext_days"] for c in r["breakdowns"][b]))
-        row["Total"] = float(r["total"])
+        row[EXT_TOTAL if show_dry else "Total"] = float(r["total"])
         if show_days:
             row["Total Days"] = int(r.get("total_ext_days", 0))
         row["Waived"] = float(r.get("waived", 0))
@@ -2955,6 +3018,9 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False):
             row["Weekend/holiday waived"] = float(r.get("cal_waived", 0))
             if show_days:
                 row["Weekend/holiday Days"] = int(r.get("cal_waived_days", 0))
+        if show_dry:
+            row["Dry run fees"] = float(r.get("extra", 0))
+            row[GRAND_TOTAL] = float(r.get("grand", r["total"]))
         rows.append(row)
     cfg = {"No": _cc("TextColumn", "No", align="center", width="small", pinned=True)}
     pin_plan = _bin_pin_plan({b: max([len(r_[f"Bin {b}"]) for r_ in rows] or [6]) for b in range(1, nb + 1)}) \
@@ -2966,6 +3032,10 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False):
         if show_days:
             cfg[f"Bin {b} Days"] = _cc("NumberColumn", f"Bin {b} Days", format="%d d", width="small")
     cfg["Total"] = _cc("NumberColumn", "Total", format=DOLLAR, width="small")
+    cfg[EXT_TOTAL] = _cc("NumberColumn", EXT_TOTAL, format=DOLLAR, width="small",
+                         help="Extension fees only (dry run fees are the next two columns).")
+    cfg["Dry run fees"] = _cc("NumberColumn", "Dry run fees", format=DOLLAR, width="small")
+    cfg[GRAND_TOTAL] = _cc("NumberColumn", GRAND_TOTAL, format=DOLLAR, width="small")
     if show_days:
         cfg["Total Days"] = _cc("NumberColumn", "Total Days", format="%d d", width="small")
     cfg["Waived"] = _cc("NumberColumn", "Waived", format=DOLLAR, width="small")
@@ -2976,7 +3046,8 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False):
         if show_days:
             cfg["Weekend/holiday Days"] = _cc("NumberColumn", "Weekend/holiday Days", format="%d d", width="small")
     df = pd.DataFrame(rows)
-    for c in [c for c in df.columns if c.endswith("Fee") or c in ("Total", "Waived", "Weekend/holiday waived")]:
+    for c in [c for c in df.columns if c.endswith("Fee") or c in ("Total", "Waived", "Weekend/holiday waived",
+                                                                    EXT_TOTAL, "Dry run fees", GRAND_TOTAL)]:
         if (df[c] % 1 == 0).all():      # whole dollars: show $3,000, not $3,000.00
             df[c] = df[c].astype(int)
     df.attrs["pinned_bins"] = sorted(pin_plan)
@@ -2984,7 +3055,8 @@ def build_scenario_table(results, num_bins, show_days, show_cal=False):
 
 
 def show_scenario_table(results, num_bins, show_days, show_cal=False):
-    df, cfg = build_scenario_table(results, num_bins, show_days, show_cal)
+    show_dry = bool(results and results[0].get("extra"))
+    df, cfg = build_scenario_table(results, num_bins, show_days, show_cal, show_dry)
     data = df
     try:
         # Streamlit draws a frozen column's text in a lighter grey than the other columns, so Bin 1 looked grey and Bin 2
@@ -3011,7 +3083,8 @@ def options_summary(opts, n_dry=0):
         out.append("dry runs reset the rental term" if o["dry_resets"]
                    else f"{n_dry} dry run(s) do not reset the rental term")
         if o["dry_fee"]:
-            out.append(f"dry run fee ${o['dry_fee']:,.0f} each × {n_dry} = ${o['dry_fee'] * n_dry:,.0f} (in every total)")
+            out.append(f"dry run fee ${o['dry_fee']:,.0f} each × {n_dry} = ${o['dry_fee'] * n_dry:,.0f} "
+                       "(shown separately, not inside the extension fees)")
     if o["row_basis_on"]:
         out.append("billing basis chosen per work order")
     if o["photo_on"]:
@@ -3078,6 +3151,33 @@ def record_events_df(parsed):
             "Waste type": e.get("waste", ""), "Remarks": e.get("remarks", ""),
         })
     return pd.DataFrame(rows)
+
+
+def _esc(txt):
+    """Two bare $ in one markdown line turn the text into green LaTeX: escape them."""
+    return txt.replace("$", "\\$")
+
+
+def render_total_metrics(results, show_days, opts, n_dry, show_waived=True):
+    """The headline numbers. Extension fees and dry run fees are always shown apart; the dry run fee is only added
+    into a clearly labelled 'Total incl. dry runs'."""
+    lo, hi = results[0]["total"], results[-1]["total"]
+    dlo, dhi = results[0].get("total_ext_days", 0), results[-1].get("total_ext_days", 0)
+    extra = results[0].get("extra", 0)
+    fee = normalize_opts(opts)["dry_fee"]
+    cols = st.columns(3 + (2 if extra else 0))
+    cols[0].metric("Extension fees (min – max)", _esc(fmt_range(lo, hi, dlo, dhi, show_days)))
+    cols[1].metric("Range", f"${hi - lo:,.0f}")
+    if show_waived:
+        w_vals = [r.get("waived", 0) for r in results]
+        wd_vals = [r.get("waived_days", 0) for r in results]
+        cols[2].metric("Waived (min – max)", _esc(fmt_range(min(w_vals), max(w_vals), min(wd_vals), max(wd_vals), show_days)))
+    if extra:
+        cols[3].metric("Dry run fees", f"${extra:,.0f}", help=f"{n_dry} dry run(s) × ${fee:,.2f}. Not included in the extension fees.")
+        cols[4].metric("Total incl. dry runs (min – max)", _esc(fmt_range(lo + extra, hi + extra, dlo, dhi, show_days)))
+    if extra:
+        st.caption(f"Dry run fees: {n_dry} × ${fee:,.2f} = ${extra:,.2f}, added on top of the extension fees "
+                   "(it is the same in every scenario).")
 
 
 def basis_caption(end_basis):
@@ -3164,18 +3264,7 @@ def render_results(cached, filters, show_tree, show_days, show_timeline, interch
             st.caption("Not in the table above: " + ", ".join(e["label"] for e in cached["inert"]) +
                        " (dry run, not billed because it does not reset the rental term).")
 
-    lowest, highest = results[0]["total"], results[-1]["total"]
-    lowest_ext = results[0].get("total_ext_days", 0)
-    highest_ext = results[-1].get("total_ext_days", 0)
-    w_vals = [r.get("waived", 0) for r in results]
-    wd_vals = [r.get("waived_days", 0) for r in results]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Lowest total fee", fmt_fee(lowest, lowest_ext, show_days))
-    m2.metric("Highest total fee", fmt_fee(highest, highest_ext, show_days))
-    m3.metric("Range", f"${highest - lowest:,.0f}")
-    m4.metric("Waived (min – max)",
-              fmt_range(min(w_vals), max(w_vals), min(wd_vals), max(wd_vals), show_days).replace("$", "\\$"))
-
+    render_total_metrics(results, show_days, cached.get("opts"), cached.get("dry_n", 0))
     show_scenario_table(results, num_bins, show_days, cal is not None)
 
     st.subheader("📋 Scenario breakdown")
@@ -3267,9 +3356,6 @@ def render_results(cached, filters, show_tree, show_days, show_timeline, interch
                     )
                 st.write(line)
 
-    if cached.get("extra_fee"):
-        st.write(f"**Dry run fees:** {cached.get('dry_n', 0)} × \\${normalize_opts(cached.get('opts'))['dry_fee']:,.0f} = "
-                 f"**\\${cached['extra_fee']:,.0f}** — included in every scenario's total above.")
     info = cached.get("saved_msg")
     if info:
         st.info(info)
@@ -3309,10 +3395,8 @@ def render_static_view_of_record(rec, show_days):
     summary = options_summary(parsed["opts"], n_dry)
     if summary:
         st.caption("⚙️ Options in effect: " + "; ".join(summary) + ".")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Lowest fee", fmt_fee(results[0]["total"], results[0].get("total_ext_days", 0), show_days))
-    m2.metric("Highest fee", fmt_fee(results[-1]["total"], results[-1].get("total_ext_days", 0), show_days))
-    m3.metric("Scenarios", f"{len(results):,}")
+    render_total_metrics(results, show_days, parsed["opts"], n_dry, show_waived=False)
+    st.metric("Scenarios", f"{len(results):,}")
     show_scenario_table(results, parsed["num_bins"], show_days, make_cal(parsed["opts"]) is not None)
     with st.expander("🧾 Work orders in this run (audit)"):
         st.dataframe(record_events_df(parsed), hide_index=True, **STRETCH)
@@ -3338,8 +3422,10 @@ def render_record_comparison(rec_a, rec_b, show_days):
             st.markdown(f"### {icon} {rec['customer']}")
             st.caption(f"{rec.get('version', '')}")
             if results:
-                st.metric("Lowest", fmt_fee(results[0]["total"], results[0].get("total_ext_days", 0), show_days))
-                st.metric("Highest", fmt_fee(results[-1]["total"], results[-1].get("total_ext_days", 0), show_days))
+                st.metric("Lowest extension fees", fmt_fee(results[0]["total"], results[0].get("total_ext_days", 0), show_days))
+                st.metric("Highest extension fees", fmt_fee(results[-1]["total"], results[-1].get("total_ext_days", 0), show_days))
+                if results[0].get("extra"):
+                    st.metric("Dry run fees (separate)", f"${results[0]['extra']:,.0f}")
                 st.metric("Scenarios", f"{len(results):,}")
                 st.write(f"📋 Events: {len(parsed['events'])}")
                 st.write(f"⏱️ Free days: {parsed['free_days']}")
@@ -3373,16 +3459,16 @@ def render_rerun_results(rec, new_free_days, new_rate, show_days):
         st.warning("No valid scenarios with these new terms.")
         return
     lowest, highest = results[0]["total"], results[-1]["total"]
-    orig_min, orig_max = rec.get("min_total", 0), rec.get("max_total", 0)
+    orig_min, orig_max = rec_ext_total(rec, "min_total"), rec_ext_total(rec, "max_total")
     st.markdown(
         f"**Original:** {parsed['free_days']} free days @ "
         f"\\${parsed['rate']:.2f}/day → \\${orig_min:,.0f} – \\${orig_max:,.0f}"
     )
     st.markdown(f"**New:** {new_free_days} free days @ \\${new_rate:.2f}/day")
     m1, m2 = st.columns(2)
-    m1.metric("Lowest fee (new)", fmt_fee(lowest, results[0].get("total_ext_days", 0), show_days),
+    m1.metric("Lowest extension fees (new)", fmt_fee(lowest, results[0].get("total_ext_days", 0), show_days),
               delta=f"${lowest - orig_min:+,.0f}")
-    m2.metric("Highest fee (new)", fmt_fee(highest, results[-1].get("total_ext_days", 0), show_days),
+    m2.metric("Highest extension fees (new)", fmt_fee(highest, results[-1].get("total_ext_days", 0), show_days),
               delta=f"${highest - orig_max:+,.0f}")
     show_scenario_table(results, parsed["num_bins"], show_days, make_cal(parsed["opts"]) is not None)
 
@@ -3443,6 +3529,7 @@ def reload_record_to_calculator(rec):
         rec.get("customer", ""),
         f"📌 Loaded from history: **{rec.get('customer', '')}** — {rec.get('version', '')}")
     S["nav"] = NAV_CALC  # the page switch happens in Python, no browser scripting involved
+    S["_scroll_top_once"] = True
 
 
 def do_reload_cb(rec_id):
@@ -3535,9 +3622,9 @@ def table_tips():
             "The first date typed in an empty row pre-fills that row's other blank dates; those follow if you "
             "change a date you typed, and a cell you typed yourself is never overwritten. A blank **Return** means "
             "the bin was back on site from the **Loaded** date. **S/Rtn**: the empty bin returns on/after Loaded. "
-            "**S/Swap**: the empty bin is dropped on/before Loaded. Never before the Request date. The **Check** column "
-            "shows which dates are pre-filled (↻); “Keep pre-filled dates” freezes them. Only the date for the billing "
-            "basis is required; clear any cell you don't need.")
+            "**S/Swap**: the empty bin is dropped on/before Loaded. Never before the Request date. Pre-filled dates are "
+            "tinted light blue; “Keep pre-filled dates” freezes them. A cell with a blocking problem is filled red "
+            "(hover for the reason). Only the date for the billing basis is required; clear any cell you don't need.")
 
 
 def placeholder_kw(calendar_mode):
@@ -3583,7 +3670,8 @@ def render_table_mode(num_bins):
     pins = set(frozen_cols())
 
     def cfg_for(col, kind, label=None, **kw):
-        return _cc(kind, label or col, pinned=(col in pins), **kw)
+        kw.pop("width", None)
+        return _cc(kind, label or col, pinned=(col in pins), width=COL_WIDTHS.get(col, 100), **kw)
 
     def date_col(col, **kw):
         if cal:
@@ -3600,17 +3688,13 @@ def render_table_mode(num_bins):
             height=tbl_height(len(S["rows"])),
             column_order=visible_cols(),
             **placeholder_kw(cal),
-            disabled=[COL_NO, COL_POSS, COL_DISP_PIN, COL_CHECK],
+            disabled=[COL_NO, COL_POSS],
             column_config={
-                COL_NO: _cc("TextColumn", "No", align="center", width="small", pinned=(COL_NO in pins)),
-                COL_CHECK: cfg_for(COL_CHECK, "TextColumn", width=170,
-                                   help="Read-only. ⚠ = what blocks Calculate on this row. △ = worth a look. "
-                                        "↻ = these cells were pre-filled for you and will follow the dates you typed "
-                                        "until you type them yourself (or press “Keep pre-filled dates”)."),
-                COL_DISP_PIN: _cc("TextColumn", COL_DISP_PIN, width=125, pinned=True,
-                                  help="Read-only copy of Disposal date, frozen at the left so it stays visible when "
-                                       "you scroll right. Edit the real Disposal date column. Switch off under "
-                                       "Table settings."),
+                COL_NO: _cc("TextColumn", "No", align="center", width=COL_WIDTHS[COL_NO], pinned=(COL_NO in pins)),
+                COL_DISP_PIN: _cc("TextColumn", COL_DISP_PIN, width=COL_WIDTHS[COL_DISP_PIN], pinned=True,
+                                  help="A second copy of Disposal date, frozen at the left so it stays visible when "
+                                       "you scroll right. Typing here is the same as typing in the real Disposal date "
+                                       "column (and the other way round). Switch off under Table settings."),
                 COL_TYPE: cfg_for(COL_TYPE, "SelectboxColumn",
                                   help="S/Rtn = service & return (bin comes back) · S/Repo = rental ends (no return "
                                        "date) · S/Swap = empty bin dropped, full bin loaded · Dry run = truck went, "
@@ -3797,7 +3881,7 @@ def row_toolbar(mode):
     n = len(S["rows"])
     for _k, _hi in (("ins_pos", max(n, 1)), ("mv_from", max(n, 1)), ("mv_to", max(n, 1)), ("ins_n", 20)):
         S[_k] = min(max(int(S.get(_k, 1)), 1), _hi)      # keep the stored value inside the current range
-    cols = [c for c in visible_cols() if c not in (COL_DISP_PIN, COL_CHECK)]
+    cols = [c for c in visible_cols() if c != COL_DISP_PIN]
     if S.get("sort_col") not in cols:
         S["sort_col"] = COL_REQUEST if COL_REQUEST in cols else cols[0]
     c = st.columns([2.2, 1.4, 0.9, 1.3, 1.1, 1.35, 1.35], vertical_alignment="bottom")
@@ -3822,7 +3906,7 @@ def row_toolbar(mode):
     d[3].button("🗑 Delete row", key="del_row_go", on_click=delete_row_cb, disabled=n < 1,
                 help="Deletes the row number shown in Row #.", **STRETCH)
     d[5].button("🔒 Keep pre-filled dates", key="keep_auto_go", on_click=keep_prefilled_cb, disabled=n < 1,
-                help="Pre-filled dates (shown as ↻ in the Check column) follow the dates you typed. This freezes them "
+                help="Pre-filled dates (light blue in the table) follow the dates you typed. This freezes them "
                      "as they are now, as if you had typed them. Undoable.", **STRETCH)
     with st.expander("↔ More: move a row, drag rows and columns"):
         mc = st.columns([1, 1, 1, 1], vertical_alignment="bottom")
@@ -3887,7 +3971,10 @@ def events_panel(num_bins, end_basis):
 
     for msg in S.pop("_flash_notices", []):
         st.info(msg)
-    render_issues(validate_issues(S["rows"], int(num_bins), end_basis, current_opts(), S.get("delivery_last")))
+    issues = validate_issues(S["rows"], int(num_bins), end_basis, current_opts(), S.get("delivery_last"))
+    S["_n_block"] = sum(1 for x in issues if x["level"] == "error")
+    S["_marks"] = grid_marks(S["rows"], issues) if mode == TABLE_MODE else []
+    render_issues(issues)
     show_possible_why(S["rows"])
     if current_opts()["photo_on"]:
         show_photo_report(S["rows"])
@@ -3947,7 +4034,7 @@ def run_calculation(delivery_dates, free_days, rate, num_bins, end_basis, filter
     n_err = sum(1 for x in issues if x["level"] == "error")
     if n_err:
         render_issues(issues)
-        _toast(f"Not calculated — {n_err} problem(s) to fix (see the Check column).", "⚠️")
+        _toast(f"Not calculated — {n_err} problem(s) to fix (click one in the red box).", "⚠️")
         return
     if not rows:
         st.warning("Please add at least one event before calculating.")
@@ -4030,13 +4117,15 @@ def history_table(filtered, show_days):
             "Event date range": f"{min(dts)} → {max(dts)}" if dts else "—",
             "Events": len(h["events"]),
             "Scenarios": int(h.get("scenario_count", 0)),
-            "Min fee": float(h["min_total"]),
+            "Min fee": rec_ext_total(h, "min_total"),
         }
         if show_days:
             row["Min days"] = int(h.get("min_ext_days") or 0)
-        row["Max fee"] = float(h["max_total"])
+        row["Max fee"] = rec_ext_total(h, "max_total")
         if show_days:
             row["Max days"] = int(h.get("max_ext_days") or 0)
+        if any(rec_dry_total(x) for x in filtered):
+            row["Dry run fees"] = rec_dry_total(h)
         row["Logged"] = h.get("logged_at", "—")
         rows.append(row)
     cfg = {
@@ -4044,11 +4133,12 @@ def history_table(filtered, show_days):
         "Scenarios": _cc("NumberColumn", "Scenarios", format="%d", width="small"),
         "Min fee": _cc("NumberColumn", "Min fee", format=DOLLAR, width="small"),
         "Max fee": _cc("NumberColumn", "Max fee", format=DOLLAR, width="small"),
+        "Dry run fees": _cc("NumberColumn", "Dry run fees", format=DOLLAR, width="small"),
         "Min days": _cc("NumberColumn", "Min days", format="%d d", width="small"),
         "Max days": _cc("NumberColumn", "Max days", format="%d d", width="small"),
     }
     df = pd.DataFrame(rows)
-    for c in ("Min fee", "Max fee"):
+    for c in [c for c in ("Min fee", "Max fee", "Dry run fees") if c in df.columns]:
         if (df[c] % 1 == 0).all():
             df[c] = df[c].astype(int)
     try:      # clicking a row selects that run (Streamlit 1.35+); older versions just show the table
@@ -4229,14 +4319,14 @@ def init_state():
                  ("opt_photo_on", False), ("opt_photo_distinct", False), ("opt_row_basis", False),
                  ("opt_cycle_start", DEFAULT_OPTS["cycle_start"]), ("opt_through_on", False),
                  ("opt_through", _month_end(today_guam())), ("f_bal_mode", "qty"), ("f_bal_pct", 25),
-                 ("col_check", True), ("opt_wk_on", False),
+                 ("opt_wk_on", False),
                  ("opt_weekend_days", [5, 6]), ("opt_hol_on", False), ("opt_hol_names", list(HOLIDAY_DEFAULT)),
                  ("opt_hol_observed", True), ("opt_extra_hol", []),
                  ("opt_waive_mode", DEFAULT_OPTS["waive_mode"]),
                  ("dr_rtn_early", False),
                  ("col_waste", True), ("col_remarks", True), ("col_poss", True), ("col_paid", False),
                  ("date_cells", "text"), ("year_rule", "current"), ("pin_cols", [COL_NO]), ("pin_disp_copy", True),
-                 ("pin_bins", True), ("pin_sidebar", False), ("clr_col", COL_REQUEST),
+                 ("pin_bins", True), ("clr_col", COL_REQUEST),
                  ("sort_dir", "Ascending")):
         d(k, v)
     d("col_order", [c for c in TBL_COLS if c != COL_NO])
@@ -4288,9 +4378,12 @@ def inject_css():
         }}
         .st-key-app_header [data-testid="stRadio"] label:has(input:checked) p {{ color: #fff; font-weight: 600; }}
         [data-testid="stTooltipContent"] {{ max-width: min(22rem, 88vw) !important; }}
-        /* the real "Pin sidebar" switch is driven by the floating 📌 button */
-        .st-key-pin_sidebar {{ position: fixed !important; left: -9999px; top: 0; width: 1px; height: 1px;
-                               overflow: hidden; opacity: 0; }}
+        /* blocking problems: a red box whose lines jump to the cell */
+        .bin-err-box {{ background: {"rgba(255,75,75,.14)" if dark else "#ffe9e9"}; border: 1px solid {"rgba(255,75,75,.55)" if dark else "#ffb3b3"};
+                        border-radius: .5rem; padding: .6rem .9rem; margin: .4rem 0; color: {"#ffb4b4" if dark else "#7a1f1f"}; }}
+        .bin-err-box ul {{ margin: .3rem 0 0 0; padding-left: 1.2rem; }}
+        .bin-goto {{ cursor: pointer; font-weight: 600; text-decoration: underline dotted; }}
+        .bin-goto:hover {{ text-decoration: underline; }}
         </style>""",
         unsafe_allow_html=True,
     )
@@ -4329,38 +4422,67 @@ _HELPER_HTML = """<script>
     if (!btn.disabled) btn.click();
   }, true);
 
-  // ---- the 📌 button: always visible, sits where the sidebar's open / close button is ----
-  var PIN0 = "__PIN__" === "1";
+  // ---- the 📌 button: small, only while the sidebar is open, beside the sidebar's « button ----
+  // Pinned = whenever the sidebar is open and would cover the page (narrow windows), the page is moved over by the
+  // amount it covers. The sidebar can still be collapsed with its own button; the page then moves back.
+  // The on/off state is kept in this browser (localStorage), so toggling it never reruns the app.
+  var pinOn = false;
+  try { pinOn = W.localStorage.getItem('bin_calc_pin_sidebar') === '1'; } catch (e) {}
   var pbtn = doc.getElementById('bin-pin-btn');
   if (pbtn) pbtn.remove();
   pbtn = doc.createElement('button');
   pbtn.id = 'bin-pin-btn'; pbtn.type = 'button'; pbtn.textContent = '📌';
-  pbtn.setAttribute('aria-pressed', PIN0 ? 'true' : 'false');
-  pbtn.title = PIN0 ? 'Sidebar pinned open — click to unpin'
-                    : 'Pin the sidebar open (the page moves over so the sidebar never covers it)';
-  pbtn.style.cssText = 'position:fixed;z-index:1000002;top:14px;left:56px;width:30px;height:28px;padding:0;' +
-    'border-radius:6px;cursor:pointer;font-size:15px;line-height:1;' +
-    (PIN0 ? 'background:#ff4b4b;border:1px solid #ff4b4b;color:#fff;'
-          : 'background:rgba(128,128,128,.18);border:1px solid rgba(128,128,128,.55);color:inherit;');
-  pbtn.onclick = function () {
-    var lab = doc.querySelector('.st-key-pin_sidebar label');
-    if (lab) lab.click();
+  pbtn.style.cssText = 'position:absolute;z-index:5;top:16px;left:200px;width:22px;height:22px;padding:0;display:none;' +
+    'border-radius:5px;cursor:pointer;font-size:11px;line-height:1;color:inherit;';
+  function paintPin() {
+    pbtn.setAttribute('aria-pressed', pinOn ? 'true' : 'false');
+    pbtn.title = pinOn ? 'Pinned: the page is moved over so the sidebar never covers it — click to unpin'
+                       : 'Pin: move the page over so the sidebar never covers it';
+    pbtn.style.background = pinOn ? 'rgba(128,128,128,.40)' : 'transparent';
+    pbtn.style.border = pinOn ? '1px solid rgba(128,128,128,.9)' : '1px solid rgba(128,128,128,.45)';
+    pbtn.style.opacity = pinOn ? '1' : '.65';
+  }
+  paintPin();
+  var pstyle = doc.getElementById('bin-pin-style'); if (pstyle) pstyle.remove();
+  pstyle = doc.createElement('style'); pstyle.id = 'bin-pin-style';
+  pstyle.textContent = '[data-testid="stMain"]{margin-left:var(--bin-pin-shift,0px) !important;' +
+    'width:calc(100% - var(--bin-pin-shift,0px)) !important;min-width:0 !important;}';
+  function fitPin() {
+    var sb = doc.querySelector('[data-testid="stSidebar"]'), mn = doc.querySelector('[data-testid="stMain"]');
+    if (!sb || !mn) return;
+    if (!pinOn) { doc.documentElement.style.removeProperty('--bin-pin-shift'); if (pstyle.parentNode) pstyle.remove(); return; }
+    if (!pstyle.parentNode) doc.head.appendChild(pstyle);
+    doc.documentElement.style.setProperty('--bin-pin-shift', '0px');
+    var shift = sb.getAttribute('aria-expanded') === 'false' ? 0 :
+      Math.max(0, Math.round(sb.getBoundingClientRect().right - mn.getBoundingClientRect().left));
+    doc.documentElement.style.setProperty('--bin-pin-shift', shift + 'px');
+  }
+  pbtn.onclick = function (e) {
+    e.stopPropagation();
+    pinOn = !pinOn; try { W.localStorage.setItem('bin_calc_pin_sidebar', pinOn ? '1' : '0'); } catch (x) {}
+    paintPin(); fitPin();
   };
-  doc.body.appendChild(pbtn);
+  // The button lives INSIDE the sidebar's scrolling container (in a zero-height "sticky" strip, so it stays put while the
+  // sidebar is scrolled): on narrow windows Streamlit closes the sidebar when you press the mouse anywhere outside that
+  // container, which a button placed elsewhere would count as.
+  var pwrap = doc.getElementById('bin-pin-wrap'); if (pwrap) pwrap.remove();
+  pwrap = doc.createElement('div'); pwrap.id = 'bin-pin-wrap';
+  pwrap.style.cssText = 'position:sticky;top:10px;height:0;z-index:50;overflow:visible;';
+  pwrap.appendChild(pbtn);
+  pbtn.style.top = '0px';
   function placePin() {
-    var sb = doc.querySelector('[data-testid="stSidebar"]'), left = 56, top = 14;
-    if (sb && sb.getAttribute('aria-expanded') !== 'false') {
-      left = Math.round(sb.getBoundingClientRect().right) - 78;          // beside the sidebar's « button
-    } else {
-      var ex = doc.querySelector('[data-testid="stExpandSidebarButton"]');   // right of the » button
-      if (ex) { var r = ex.getBoundingClientRect(); if (r.width) { left = Math.round(r.right) + 6; top = Math.round(r.top + (r.height - 28) / 2); } }
-    }
-    pbtn.style.left = Math.max(4, left) + 'px'; pbtn.style.top = Math.max(4, top) + 'px';
+    var sb = doc.querySelector('[data-testid="stSidebar"]');
+    if (!sb || sb.getAttribute('aria-expanded') === 'false') { pbtn.style.display = 'none'; return; }
+    var r = sb.getBoundingClientRect();
+    if (r.right < 60) { pbtn.style.display = 'none'; return; }
+    var host = sb.querySelector('[data-testid="stSidebarContent"]') || sb;
+    if (pwrap.parentNode !== host) host.insertBefore(pwrap, host.firstChild);
+    pbtn.style.display = 'block'; pbtn.style.left = Math.max(4, Math.round(r.width - 74)) + 'px';
   }
   var ppt = W.setInterval(placePin, 300);
   on(W, 'resize', placePin);
   placePin();
-  undo.push(function () { W.clearInterval(ppt); if (pbtn) pbtn.remove(); });
+  undo.push(function () { W.clearInterval(ppt); if (pwrap) pwrap.remove(); });
 
   // ---- a dropdown opened inside the table must not float in place when the page scrolls: close it ----
   var ovSeen = null, ovT = 0;
@@ -4379,41 +4501,178 @@ _HELPER_HTML = """<script>
     a.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true}));
   }, true);
 
-  // ---- pinned sidebar: stay open, and move the page over by however much the sidebar covers it ----
-  var PIN = "__PIN__" === "1";
-  var pstyle = doc.getElementById('bin-pin-style');
-  if (pstyle) pstyle.remove();
-  if (PIN) {
-    pstyle = doc.createElement('style'); pstyle.id = 'bin-pin-style';
-    pstyle.textContent = '[data-testid="stSidebarCollapseButton"]{display:none !important;}' +
-      '[data-testid="stMain"]{margin-left:var(--bin-pin-shift,0px) !important;' +
-      'width:calc(100% - var(--bin-pin-shift,0px)) !important;min-width:0 !important;}';
-    doc.head.appendChild(pstyle);
-    var fitPin = function () {
-      var sb = doc.querySelector('[data-testid="stSidebar"]'), mn = doc.querySelector('[data-testid="stMain"]');
-      if (!sb || !mn) return;
-      if (sb.getAttribute('aria-expanded') === 'false') {
-        var ex = doc.querySelector('[data-testid="stExpandSidebarButton"]');
-        if (ex) ex.click();
-        return;
-      }
-      doc.documentElement.style.setProperty('--bin-pin-shift', '0px');
-      var shift = Math.max(0, Math.round(sb.getBoundingClientRect().right - mn.getBoundingClientRect().left));
-      doc.documentElement.style.setProperty('--bin-pin-shift', shift + 'px');
-    };
-    var pt = W.setInterval(fitPin, 400);
-    on(W, 'resize', fitPin);
-    fitPin();
-    undo.push(function () {
-      W.clearInterval(pt);
-      if (pstyle) pstyle.remove();
-      doc.documentElement.style.removeProperty('--bin-pin-shift');
-    });
+  // ---- marks drawn over the table: blocking problems (red) and pre-filled dates (light blue), tooltips, jump ----
+  // The table is a canvas, so its cell positions are read from what it drew: the vertical lines in its header strip
+  // and the horizontal lines in its body. Column names come from the table's (hidden) accessibility header.
+  var GRID = '.st-key-events_tbl [data-testid="stDataFrame"]';
+  ['bin-marks', 'bin-tip', 'bin-marks-style'].forEach(function (id) { var o = doc.getElementById(id); if (o) o.remove(); });
+  var MST = doc.createElement('style'); MST.id = 'bin-marks-style';
+  MST.textContent = '@keyframes binblink{0%{opacity:0}20%{opacity:1}70%{opacity:1}100%{opacity:0}}' +
+    '.bin-blink{position:absolute;box-sizing:border-box;border:3px solid #ff2b2b;border-radius:3px;' +
+    'box-shadow:0 0 0 4px rgba(255,43,43,.35);animation:binblink 1.3s ease-out 1 forwards;pointer-events:none}';
+  doc.head.appendChild(MST);
+  var ROOT = doc.createElement('div'); ROOT.id = 'bin-marks';
+  ROOT.style.cssText = 'position:fixed;z-index:900;pointer-events:none;overflow:hidden;display:none;';
+  var MK = doc.createElement('div'); MK.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;';
+  ROOT.appendChild(MK);                  // the marks live in MK (rebuilt every refresh); a blink is added to ROOT itself
+  doc.body.appendChild(ROOT);
+  var TIP = doc.createElement('div'); TIP.id = 'bin-tip';
+  TIP.style.cssText = 'position:fixed;z-index:1000001;display:none;max-width:300px;padding:6px 9px;border-radius:6px;' +
+    'font:12px/1.35 "Source Sans Pro",Arial,sans-serif;background:#262730;color:#fff;pointer-events:none;' +
+    'box-shadow:0 2px 8px rgba(0,0,0,.35);';
+  doc.body.appendChild(TIP);
+  undo.push(function () { ROOT.remove(); TIP.remove(); MST.remove(); });
+  var boxes = [], tipLock = 0;
+  function lum(d, i) { return 0.3 * d[4 * i] + 0.59 * d[4 * i + 1] + 0.11 * d[4 * i + 2]; }
+  function lines(arr) {                    // positions (px) of thin dark lines in a 1-px-wide strip of pixels
+    var s = arr.slice().sort(function (a, b) { return a - b; }), bg = s[Math.floor(s.length * 0.7)], out = [], i;
+    for (i = 0; i < arr.length; i++) {
+      if (arr[i] < bg - 12) { out.push(i); while (i + 1 < arr.length && arr[i + 1] < bg - 12) i++; }
+    }
+    return out;
   }
+  function readGeom() {
+    try {
+      var g = doc.querySelector(GRID); if (!g) return null;
+      var cs = g.querySelectorAll('canvas'), sc = g.querySelector('.dvn-scroller'); if (!cs.length || !sc) return null;
+      var hc = cs[0], bc = cs[0], i;
+      for (i = 0; i < cs.length; i++) { if (cs[i].height < hc.height) hc = cs[i]; if (cs[i].height > bc.height) bc = cs[i]; }
+      var gr = g.getBoundingClientRect(), hr = hc.getBoundingClientRect();
+      if (!hr.width || !hr.height) return null;
+      var dpr = hc.width / hr.width, x, y, arr = [];
+      // the row-marker column's right edge = the first vertical line in the header strip
+      var hd = hc.getContext('2d').getImageData(0, Math.min(hc.height - 1, Math.round(2 * dpr)), hc.width, 1).data;
+      for (x = 0; x < hc.width; x++) arr.push(lum(hd, x));
+      var edges = lines(arr).map(function (v) { return v / dpr; });
+      var markerW = edges.length ? edges[0] : 32;
+      // row height = spacing of the horizontal lines in the body
+      var bd = bc.getContext('2d').getImageData(Math.round(3 * dpr), 0, 1, bc.height).data; arr = [];
+      for (y = 0; y < bc.height; y++) arr.push(lum(bd, y));
+      var seps = lines(arr).map(function (v) { return v / dpr; }), diffs = [];
+      for (i = 1; i < seps.length; i++) diffs.push(seps[i] - seps[i - 1]);
+      diffs.sort(function (a, b) { return a - b; });
+      var rh = diffs.length ? diffs[Math.floor(diffs.length / 2)] : 25;
+      var hh = cs.length > 1 ? hr.height : (seps.length ? seps[0] + 1 : rh);
+      // columns: known widths, frozen first
+      var lay = (W._binData || {}).layout || [], cols = {}, pinW = markerW, run = 0, total = markerW;
+      lay.forEach(function (c) {
+        total += c.w;
+        if (c.p) { cols[c.c] = {pinned: true, left: pinW, w: c.w}; pinW += c.w; }
+      });
+      lay.forEach(function (c) { if (!c.p) { cols[c.c] = {pinned: false, cum: run, w: c.w}; run += c.w; } });
+      var ok = lay.length > 0 && Math.abs(sc.scrollWidth - total) <= 6;      // false if a column was dragged wider/narrower
+      return {g: g, sc: sc, gr: gr, hr: hr, rh: rh, hh: hh, cols: cols, pinR: pinW, W: hr.width, ok: ok, total: total};
+    } catch (e) { return null; }
+  }
+  function cellRect(G, r, name) {
+    var c = G.cols[name]; if (!c || !G.ok) return null;
+    var left = c.pinned ? c.left : G.pinR + c.cum - G.sc.scrollLeft, right = left + c.w;
+    var top = G.hh + (r - 1) * G.rh - G.sc.scrollTop;
+    var l = left, w = c.w, t = top, h = G.rh;
+    if (!c.pinned && l < G.pinR) { w -= (G.pinR - l); l = G.pinR; }
+    if (t < G.hh) { h -= (G.hh - t); t = G.hh; }
+    if (l + w > G.W) w = G.W - l;
+    if (t + h > G.gr.height) h = G.gr.height - t;
+    return {l: l, t: t, w: w, h: h, ok: w > 2 && h > 2, pinned: c.pinned, fullL: left, fullR: right};
+  }
+  W._binGeom = readGeom; W._binCell = cellRect;   // (kept on the window so it can be inspected when testing)
+  function drawMarks() {
+    var D = W._binData || {}, cells = D.cells || [], G = cells.length ? readGeom() : null;
+    boxes = [];
+    if (!G || !G.ok) { ROOT.style.display = 'none'; MK.innerHTML = ''; return; }
+    var ox = G.hr.left - G.gr.left, oy = G.hr.top - G.gr.top;
+    ROOT.style.left = G.gr.left + 'px'; ROOT.style.top = G.gr.top + 'px';
+    ROOT.style.width = G.gr.width + 'px'; ROOT.style.height = G.gr.height + 'px'; ROOT.style.display = 'block';
+    var html = '', order = cells.slice().sort(function (a, b) { return (a.k === 'err') - (b.k === 'err'); });
+    order.forEach(function (c) {
+      var rc = cellRect(G, c.r, c.c); if (!rc || !rc.ok) return;
+      html += '<div style="position:absolute;box-sizing:border-box;left:' + (ox + rc.l) + 'px;top:' + (oy + rc.t) + 'px;width:' +
+        rc.w + 'px;height:' + rc.h + 'px;' + (c.k === 'err'
+          ? 'background:rgba(255,75,75,.24);border:1px solid rgba(255,75,75,.9);'
+          : 'background:rgba(66,133,244,.11);') + '"></div>';
+      boxes.push({l: G.hr.left + rc.l, t: G.hr.top + rc.t, w: rc.w, h: rc.h, k: c.k, text: c.t});
+    });
+    MK.innerHTML = html;
+  }
+  var drawQ = false;
+  function drawSoon() { if (drawQ) return; drawQ = true; W.requestAnimationFrame(function () { drawQ = false; drawMarks(); }); }
+  var mpt = W.setInterval(drawMarks, 300);
+  undo.push(function () { W.clearInterval(mpt); });
+  on(doc, 'scroll', drawSoon, true);
+  on(W, 'resize', drawSoon);
+  on(W, 'bin-data', function () { drawSoon(); pageScroll(); });
+  function showTip(text, x, y) {
+    TIP.textContent = text; TIP.style.display = 'block';
+    var w = TIP.offsetWidth, h = TIP.offsetHeight;
+    TIP.style.left = Math.max(4, Math.min(W.innerWidth - w - 6, x + 12)) + 'px';
+    TIP.style.top = Math.max(4, (y + 18 + h > W.innerHeight) ? y - h - 10 : y + 18) + 'px';
+  }
+  on(doc, 'mousemove', function (e) {
+    if (Date.now() < tipLock) return;
+    var hit = null, i;
+    for (i = boxes.length - 1; i >= 0; i--) {
+      var b = boxes[i];
+      if (e.clientX >= b.l && e.clientX < b.l + b.w && e.clientY >= b.t && e.clientY < b.t + b.h) { hit = b; break; }
+    }
+    if (hit) showTip(hit.text, e.clientX, e.clientY); else TIP.style.display = 'none';
+  });
+  function gotoCell(r, name) {
+    var D = W._binData || {}, errs = (D.cells || []).filter(function (c) { return c.k === 'err' && c.r === r; });
+    if (!errs.length) return;
+    var tgt = null, i;
+    for (i = 0; i < errs.length; i++) if (errs[i].c === name) tgt = errs[i];
+    tgt = tgt || errs[0];
+    var G = readGeom(); if (!G) return;
+    if (G.gr.top < 150 || G.gr.bottom > W.innerHeight - 10) G.g.scrollIntoView({block: 'center'});       // bring the table into view
+    var rh = G.rh || 25, vis = G.gr.height - G.hh, rowTop = (tgt.r - 1) * rh, st = G.sc.scrollTop;
+    if (rowTop < st || rowTop + rh > st + vis) G.sc.scrollTop = Math.max(0, rowTop - (vis - rh) / 2);     // ...the row
+    var col = G.cols[tgt.c];
+    if (col && !col.pinned) {                                                                          // ...and the column
+      var room = G.W - G.pinR, sl = G.sc.scrollLeft;
+      if (col.cum < sl || col.cum + col.w > sl + room) G.sc.scrollLeft = Math.max(0, col.cum - (room - col.w) / 2);
+    }
+    setTimeout(function () {
+      drawMarks();
+      var G3 = readGeom(), rc3 = G3 ? cellRect(G3, tgt.r, tgt.c) : null;
+      if (!G3 || !rc3 || !rc3.ok) { showTip(tgt.t, G.hr.left + 40, G.hr.top + 40); tipLock = Date.now() + 5000; return; }
+      var bl = doc.createElement('div'); bl.className = 'bin-blink';
+      bl.style.cssText = 'left:' + (G3.hr.left - G3.gr.left + rc3.l - 1) + 'px;top:' + (G3.hr.top - G3.gr.top + rc3.t - 1) +
+        'px;width:' + (rc3.w + 2) + 'px;height:' + (rc3.h + 2) + 'px;';
+      ROOT.appendChild(bl); setTimeout(function () { bl.remove(); }, 1500);
+      showTip(tgt.t, G3.hr.left + rc3.l + 14, G3.hr.top + rc3.t + 2); tipLock = Date.now() + 5000;
+      setTimeout(function () { if (Date.now() >= tipLock) TIP.style.display = 'none'; }, 5100);
+    }, 220);
+  }
+  on(doc, 'click', function (e) {
+    var t = e.target && e.target.closest ? e.target.closest('.bin-goto') : null;
+    if (!t) return;
+    gotoCell(parseInt(t.getAttribute('data-r'), 10), t.getAttribute('data-c'));
+  });
+  on(doc, 'mousedown', function () { tipLock = 0; TIP.style.display = 'none'; }, true);
+
+  // ---- changing page (Calculator <-> History) always starts at the top, instead of inheriting the old scroll ----
+  function pageScroll() {
+    var D = W._binData || {}, pg = D.page;
+    if (!pg) return;
+    var prev = W._binPage; W._binPage = pg;
+    if (prev === undefined || (prev === pg && !D.top)) return;
+    var m = doc.querySelector('[data-testid="stMain"]'), n = 0;
+    var iv = W.setInterval(function () { if (m && m.scrollTop > 0) m.scrollTop = 0; if (++n > 12) W.clearInterval(iv); }, 80);
+  }
+  pageScroll();
+
+  var pt = W.setInterval(fitPin, 400);
+  on(W, 'resize', fitPin);
+  fitPin();
+  undo.push(function () {
+    W.clearInterval(pt);
+    if (pstyle.parentNode) pstyle.remove();
+    doc.documentElement.style.removeProperty('--bin-pin-shift');
+  });
 
   // ---- keep the events grid where it was ----
   var SEL = '.st-key-events_tbl .dvn-scroller';
-  var saved = {l: 0, t: 0}, frozen = false, token = 0, queued = false, tracked = null, pending = false;
+  var saved = W._binSaved || (W._binSaved = {l: 0, t: 0}), frozen = false, token = 0, queued = false, tracked = null, pending = false;
   var USER = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
   function grid() { return doc.querySelector(SEL); }
   on(doc, 'scroll', function (e) {
@@ -4539,15 +4798,15 @@ _SETTING_CHECKS = {
     "opt_photo_on": _ok_bool, "opt_photo_distinct": _ok_bool, "opt_row_basis": _ok_bool,
     "opt_cycle_start": _ok_choice(list(CYCLE_STARTS)), "opt_waive_mode": _ok_choice(list(WAIVE_MODES)),
     "opt_through_on": _ok_bool, "opt_through": lambda v: isinstance(v, date),
-    "f_bal_mode": _ok_choice(["qty", "pct"]), "f_bal_pct": _ok_int(0, 100), "col_check": _ok_bool,
+    "f_bal_mode": _ok_choice(["qty", "pct"]), "f_bal_pct": _ok_int(0, 100),
     "opt_wk_on": _ok_bool, "opt_hol_on": _ok_bool, "opt_hol_observed": _ok_bool,
     "opt_hol_names": _ok_list(list(HOLIDAY_BY_KEY)),
     "opt_extra_hol": lambda v: isinstance(v, list) and all(isinstance(x, str) and _iso_to_date(x) for x in v),
     "opt_weekend_days": lambda v: isinstance(v, list) and all(isinstance(x, int) and 0 <= x <= 6 for x in v),
-    "dr_rtn_early": _ok_bool, "pin_sidebar": _ok_bool,
+    "dr_rtn_early": _ok_bool,
     "col_waste": _ok_bool, "col_remarks": _ok_bool, "col_poss": _ok_bool, "col_paid": _ok_bool,
     "date_cells": _ok_choice(["text", "calendar"]), "year_rule": _ok_choice(["current", "closest"]),
-    "pin_cols": _ok_list(TBL_COLS), "pin_disp_copy": _ok_bool, "pin_bins": _ok_bool,
+    "pin_cols": lambda v: isinstance(v, list) and all(x in TBL_COLS for x in v), "pin_disp_copy": _ok_bool, "pin_bins": _ok_bool,
     "sort_dir": _ok_choice(["Ascending", "Descending"]),
 }
 for _b in range(1, 6):
@@ -4576,8 +4835,8 @@ def settings_restore(d):
                     S["_custom_free_days"] = v
                 continue
             if k == "_col_order":
-                if isinstance(v, list) and all(c in TBL_COLS for c in v):
-                    S["col_order"] = [c for c in v if c != COL_NO]
+                if isinstance(v, list):          # (a column that no longer exists, e.g. "Check", is simply dropped)
+                    S["col_order"] = [c for c in v if c in TBL_COLS and c != COL_NO]
                 continue
             if k == "opt_holidays" and isinstance(v, str) and v.strip():    # older versions: free-text holiday list
                 keep = list(S.get("opt_extra_hol") or [])
@@ -4735,10 +4994,8 @@ with st.container(key="app_header"):
     # can switch pages from Python (no browser scripting).
     _hc = st.columns([6.9, 1.25, 1.25], vertical_alignment="center")
     _hc[0].radio("Page", [NAV_CALC, NAV_HIST], key="nav", horizontal=True, label_visibility="collapsed")
-    # The "Pin sidebar" switch itself is hidden (CSS) and is clicked by the 📌 button that sits next to the sidebar's
-    # open / close button and stays visible while you scroll (see _HELPER_HTML).
-    st.checkbox("📌 Pin sidebar", key="pin_sidebar",
-                help="Keeps the sidebar open and moves the page over so the sidebar never covers it.")
+    # (The 📌 pin button is drawn by the helper script next to the sidebar's own button; its on/off state lives in the
+    # browser only, so clicking it never reruns the app and never counts as a click outside the sidebar.)
     # Undo / redo for the events (also Ctrl+Z / Ctrl+Y, wired up by the helper script below).
     _on_calc = (S.get("nav") or NAV_CALC) == NAV_CALC
     _hc[1].button("↶ Undo", key="undo_btn", on_click=undo_cb, disabled=not (S.get("undo") and _on_calc),
@@ -4747,7 +5004,8 @@ with st.container(key="app_header"):
     _hc[2].button("↷ Redo", key="redo_btn", on_click=redo_cb, disabled=not (S.get("redo") and _on_calc),
                   help=(f"Redo — Ctrl+Y or Ctrl+Shift+Z ({len(S.get('redo', []))} step(s) available)."
                         if _on_calc else "Redo applies to the Calculator's events."), **STRETCH)
-    components.html(_HELPER_HTML.replace("__PIN__", "1" if S.get("pin_sidebar") else "0"), height=0)
+    components.html(_HELPER_HTML, height=0)
+    data_slot = st.empty()      # filled at the end of the run, once this run's table marks are known
 
 page = S.get("nav") or NAV_CALC
 page_changed = S.get("_prev_page") != page
@@ -4798,6 +5056,11 @@ with st.sidebar:
         help="Locked unless you select Custom above.",
     )
     S["_free_days_now"] = int(free_days)   # what the browser backup remembers for Custom
+    st.number_input("Dry run fee ($ each)", min_value=0.0, step=10.0, format="%.2f", key="opt_dry_fee",
+                    help="A flat fee billed for EVERY work order whose Type is Dry run (the truck went but nothing was "
+                         "loaded), whether or not a dry run resets the rental term. It is shown SEPARATELY from the "
+                         "extension fees and added in its own 'Total incl. dry runs'. Set 0 for no charge. Runs saved "
+                         "before this option existed keep a $0 fee.")
     rate = st.number_input("Extension fee per day ($)", min_value=0.0, key="rate_input")
     num_bins = int(st.number_input("Number of bins on site", min_value=1, max_value=5, key="num_bins_input"))
     st.caption("Off-site days (between Loaded date and Return date) are not billed.")
@@ -4851,10 +5114,6 @@ with st.sidebar:
     st.checkbox("🚚 Dry run resets the rental term", key="opt_dry_resets",
                 help="On: a Dry run closes the current cycle on its date and the next cycle (and free days) "
                      "starts that day, like a service. Off: a Dry run is listed but has no effect on fees.")
-    st.number_input("Dry run fee ($ each)", min_value=0.0, step=10.0, format="%.2f", key="opt_dry_fee",
-                    help="A flat fee billed for EVERY work order whose Type is Dry run (the truck went but nothing was "
-                         "loaded), whether or not a dry run resets the rental term. It is added to every scenario's "
-                         "total. Set 0 for no charge. Runs saved before this option existed keep a $0 fee.")
     st.checkbox("📅 Also bill bins still on site through a date", key="opt_through_on",
                 help="For month-end billing: a bin that is still on site after its last work order keeps running until "
                      "this date (a bin with no work orders runs from its delivery date). Leave off to bill only up to "
@@ -4936,7 +5195,6 @@ with st.sidebar:
         st.checkbox("Show Waste type", key="col_waste")
         st.checkbox("Show Remarks", key="col_remarks")
         st.checkbox("Show Possible bins", key="col_poss")
-        st.checkbox("Show Check (row problems and pre-filled dates)", key="col_check")
         st.radio("Date cells", ["text", "calendar"], key="date_cells",
                  format_func=lambda k: {"text": "Type or paste (any date format)",
                                         "calendar": "Calendar pop-up (limited typing)"}[k],
@@ -5076,10 +5334,14 @@ if page == NAV_CALC:
             delivery_dates[b] = single_delivery
     S["delivery_last"] = dict(delivery_dates)
     events_panel(num_bins, end_basis)
+    n_block = int(S.get("_n_block", 0))
     calc_clicked = st.button(
         "🧮 Calculate all scenarios (or press Ctrl+Enter)",
         type="primary",
         key="calc_btn",
+        disabled=n_block > 0,
+        help=(f"Greyed out: {n_block} problem(s) must be fixed first. Click one in the red box to jump to the cell."
+              if n_block else None),
     )
     if calc_clicked:
         run_calculation(delivery_dates, free_days, rate, num_bins, end_basis, filters)
@@ -5091,5 +5353,7 @@ else:
     # ──────────────────────────────────────────
     render_history(show_days)
 
+with data_slot:
+    publish_page_data(page, S.get("_marks", []) if page == NAV_CALC else [], grid_layout())
 # Keep the browser backup current (runs on every page, after everything else).
 persist_to_browser()
