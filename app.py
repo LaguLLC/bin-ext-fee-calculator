@@ -1325,6 +1325,15 @@ def build_timeline_view(scenario, num_bins, delivery_dates, free_days):
 # ──────────────────────────────────────────────
 # Each calculation that has a customer name is saved as one "run".
 # (The JSON key is still called "version" so existing history.json files keep working.)
+_AUTO_RUN_NAME = re.compile(r"^Run \d{6} · Range (\d{6}(–\d{6})?|no dates) · \d+ bins?( \(\d+\))?$")
+
+
+def is_auto_run_name(name):
+    """True for a name this app generated ('Run 261023 · Range 260901–260930 · 2 bins'). Such a name carries the day the run
+    was MADE, so it must not be copied onto a run made on another day."""
+    return bool(_AUTO_RUN_NAME.match(str(name or "").strip()))
+
+
 def make_version_name(run_date, range_dates, num_bins):
     """'Run 261015 · Range 260901–260930 · 2 bins'.
     Run = the day (Guam) the calculation was run. Range = first–last event date."""
@@ -1462,16 +1471,16 @@ def unique_version_name(history, customer, name):
 
 def add_to_history(customer, version, delivery_dates, events, results,
                    free_days, rate, num_bins, fixed_assignments,
-                   end_basis=BASELINE_BASIS, filters=None, blanks=None, opts=None):
+                   end_basis=BASELINE_BASIS, filters=None, blanks=None, opts=None, based_on=""):
     with _history_lock():
         return _add_to_history_locked(customer, version, delivery_dates, events, results,
                                       free_days, rate, num_bins, fixed_assignments,
-                                      end_basis, filters, blanks, opts)
+                                      end_basis, filters, blanks, opts, based_on)
 
 
 def _add_to_history_locked(customer, version, delivery_dates, events, results,
                            free_days, rate, num_bins, fixed_assignments,
-                           end_basis, filters, blanks, opts=None):
+                           end_basis, filters, blanks, opts=None, based_on=""):
     history = load_history()
     min_ext = results[0].get("total_ext_days", 0) if results else 0
     max_ext = results[-1].get("total_ext_days", 0) if results else 0
@@ -1521,6 +1530,8 @@ def _add_to_history_locked(customer, version, delivery_dates, events, results,
         "logged_at": str(now.date()),                    # Guam date
         "logged_ts": now.isoformat(timespec="seconds"),  # Guam time stamp
     }
+    if based_on:
+        rec["based_on"] = based_on       # the run that was loaded into the Calculator before this one was made
     history.append(rec)
     save_history(history)
     return rec
@@ -1942,7 +1953,7 @@ def validate_issues(rows, num_bins, basis, opts=None, delivery_dates=None, rules
         if row_is_empty(r):
             add("error", i, "(whole row)", "The row is empty — fill it in, or delete it (tick its checkbox and press Delete).",
                 "empty row")
-        elif not inert:
+        elif not is_dry:             # a Dry run only needs ONE date: its other dates may stay blank, even the basis date
             if eff_b == "paid":
                 if paid is None and COL_PAID not in r.get("err", {}):
                     if q is None:
@@ -2765,17 +2776,17 @@ def apply_col_order(ids):
 
 
 _SORTER_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
-html,body{margin:0;padding:0;font:13px/1.25 "Source Sans Pro",Arial,sans-serif;background:transparent}
+html,body{margin:0;padding:0;font:var(--fs,9.8px)/1.35 var(--ff,"Source Sans",Arial,sans-serif);background:transparent}
 #list{display:flex;flex-direction:column;gap:4px;overflow-y:auto;padding:2px}
 #list.h{flex-direction:row;flex-wrap:wrap}
-.item{display:flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid var(--bd);border-radius:6px;
+.item{display:flex;align-items:center;gap:.6em;padding:.35em .7em;border:1px solid var(--bd);border-radius:.5em;
   background:var(--bg);color:var(--fg);cursor:grab;user-select:none;white-space:nowrap}
 .item.over{outline:2px solid #ff4b4b}
 .item.drag{opacity:.4}
 .grip{opacity:.55}
 .lbl{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis}
-.btn{border:1px solid var(--bd);background:transparent;color:var(--fg);border-radius:4px;cursor:pointer;
-  padding:0 5px;font-size:11px;line-height:16px}
+.btn{border:1px solid var(--bd);background:transparent;color:var(--fg);border-radius:.35em;cursor:pointer;
+  padding:0 .45em;font-size:.85em;line-height:1.5;font-family:inherit}
 .btn:hover{background:rgba(255,75,75,.2)}
 </style></head><body><div id="list"></div><script>
 (function () {
@@ -2847,10 +2858,34 @@ html,body{margin:0;padding:0;font:13px/1.25 "Source Sans Pro",Arial,sans-serif;b
   });
   window.addEventListener("resize", fit);
   if (window.ResizeObserver) new ResizeObserver(fit).observe(list);
+  // Use the page's own font and text size (the app is drawn at 70% zoom, this frame is not).
+  function syncFont() {
+    try {
+      var P = window.parent, d = P.document, root = document.documentElement;
+      var p = d.querySelector('[data-testid="stMarkdownContainer"] p') || d.body, cs = P.getComputedStyle(p);
+      root.style.setProperty("--fs", cs.fontSize); root.style.setProperty("--ff", cs.fontFamily);
+      if (!document.getElementById("pagefonts")) {           // the page's web fonts, copied (with absolute URLs) into this frame
+        var css = "", i, j;
+        for (i = 0; i < d.styleSheets.length; i++) {
+          var sh = d.styleSheets[i], rules;
+          try { rules = sh.cssRules; } catch (x) { continue; }
+          for (j = 0; j < rules.length; j++) {
+            if (rules[j].type === 5) {
+              css += rules[j].cssText.replace(/url\\(\\s*(['"]?)(.*?)\\1\\s*\\)/g, function (mm, q, u) {
+                try { return "url(" + q + new URL(u, sh.href || d.baseURI).href + q + ")"; } catch (y) { return mm; }
+              });
+            }
+          }
+        }
+        var st = document.createElement("style"); st.id = "pagefonts"; st.textContent = css; document.head.appendChild(st);
+      }
+    } catch (e) {}
+  }
   window.addEventListener("message", function (ev) {
     var m = ev.data || {};
     if (m.type !== "streamlit:render") return;
     var a = m.args || {};
+    syncFont();
     var dark = !!a.dark;
     document.documentElement.style.setProperty("--fg", dark ? "#fafafa" : "#31333f");
     document.documentElement.style.setProperty("--bg", dark ? "#262730" : "#f0f2f6");
@@ -2915,7 +2950,9 @@ def reset_events_cb():
     S["rows_anchor"] = _anchor()
     S["rows_default"] = True
     S["_flash_notices"] = []
+    S.pop("_notice_keep", None)
     S.pop("last_results", None)
+    S.pop("_loaded_from", None)
     touch("other")
 
 
@@ -2968,11 +3005,16 @@ def on_picker_change(uid, field, v):
 # ──────────────────────────────────────────────
 # Column-config helper (works across Streamlit versions)
 # ──────────────────────────────────────────────
+_CC_PARAMS = {}
+
+
 def _cc(kind, label, align=None, **kw):
     """st.column_config.<kind>(label, **kw), dropping options this Streamlit does
     not know. `align` ('center'/'right') is added as a raw key; older versions ignore it."""
     cls = getattr(st.column_config, kind)
-    ok = inspect.signature(cls).parameters
+    ok = _CC_PARAMS.get(kind)
+    if ok is None:                                   # (inspect.signature is slow: look each class up once)
+        ok = _CC_PARAMS[kind] = frozenset(inspect.signature(cls).parameters)
     cfg = cls(label, **{k: v for k, v in kw.items() if k in ok})
     if align:
         cfg["alignment"] = align
@@ -3423,6 +3465,8 @@ def render_static_view_of_record(rec, show_days):
     if not results:
         st.warning("No scenarios to show — the run has invalid data, or its filters hide every scenario.")
         return
+    if rec.get("based_on"):
+        st.caption(f"↩ Made from a loaded run: **{rec['based_on']}**")
     deliv_text = ", ".join(sorted(set(str(d) for d in parsed["delivery_dates"].values())))
     st.caption(
         f"📅 Delivery: {deliv_text} | "
@@ -3445,8 +3489,6 @@ def render_static_view_of_record(rec, show_days):
     if note:
         st.caption(note)
     show_scenario_table(shown, parsed["num_bins"], show_days, make_cal(parsed["opts"]) is not None, numbers)
-    with st.expander("🧾 Work orders in this run (audit)"):
-        st.dataframe(record_events_df(parsed), hide_index=True, **STRETCH)
 
 
 # ──────────────────────────────────────────────
@@ -3556,7 +3598,10 @@ def reload_record_to_calculator(rec):
     S["f_bal_mode"], S["f_bal_pct"] = flt["bal_mode"], flt["bal_pct"]
     set_opts_widgets(parsed["opts"])
     S["customer_name"] = rec.get("customer", "")
-    S["version_name"] = rec.get("version", "")
+    # A name typed by the user is kept; an automatic one ('Run 261023 · ...') is left blank so that the run you make now
+    # is named with TODAY's date. The link to the run it came from is kept in the record ("based_on").
+    S["version_name"] = "" if is_auto_run_name(rec.get("version")) else rec.get("version", "")
+    S["_loaded_from"] = {"customer": rec.get("customer", ""), "version": rec.get("version", "")}
     dd = {b: parsed["delivery_dates"].get(b) or min(parsed["delivery_dates"].values())
           for b in range(1, nb + 1)}
     S["staggered"] = len(set(dd.values())) > 1
@@ -3674,7 +3719,8 @@ def table_tips():
             "the bin was back on site from the **Loaded** date. **S/Rtn**: the empty bin returns on/after Loaded. "
             "**S/Swap**: the empty bin is dropped on/before Loaded. Never before the Request date. Pre-filled dates are "
             "tinted light blue; “Keep pre-filled dates” freezes them. A cell with a blocking problem is filled red "
-            "(hover for the reason). Only the date for the billing basis is required; clear any cell you don't need.")
+            "(hover for the reason). Only the date for the billing basis is required (a Dry run needs just one date of "
+            "any kind); clear any cell you don't need.")
 
 
 def placeholder_kw(calendar_mode):
@@ -3749,7 +3795,8 @@ def render_table_mode(num_bins):
                                   help="S/Rtn = service & return (bin comes back) · S/Repo = rental ends (no return "
                                        "date) · S/Swap = empty bin dropped, full bin loaded · Dry run = truck went, "
                                        "nothing loaded (charged the sidebar's Dry run fee; the sidebar also says whether "
-                                       "it resets the rental term)",
+                                       "it resets the rental term). A Dry run needs just one date: Loaded, Disposal and "
+                                       "Return may stay blank.",
                                   options=type_options, required=True, default="S/Rtn", width="small"),
                 COL_REQUEST: date_col(COL_REQUEST, help="Date the customer asked for service."),
                 COL_PAID: date_col(COL_PAID, help="Date the request was paid. Used when the billing basis is "
@@ -4019,8 +4066,18 @@ def events_panel(num_bins, end_basis):
     else:
         render_picker_mode(num_bins)
 
-    for msg in S.pop("_flash_notices", []):
-        st.info(msg)
+    # Notices (e.g. "Restored your last events...") stay for 25 s: right after a restore the page reruns once more by itself,
+    # which would otherwise remove the message before you could read it.
+    new_notes = S.pop("_flash_notices", [])
+    if new_notes:
+        S["_notice_keep"] = (now_guam().timestamp() + 25, list(new_notes))
+    keep = S.get("_notice_keep")
+    if keep:
+        if now_guam().timestamp() < keep[0]:
+            for msg in keep[1]:
+                st.info(msg)
+        else:
+            S.pop("_notice_keep", None)
     issues = validate_issues(S["rows"], int(num_bins), end_basis, current_opts(), S.get("delivery_last"))
     S["_n_block"] = sum(1 for x in issues if x["level"] == "error")
     S["_marks"] = grid_marks(S["rows"], issues) if mode == TABLE_MODE else []
@@ -4102,9 +4159,11 @@ def run_calculation(delivery_dates, free_days, rate, num_bins, end_basis, filter
     snapshot = snapshot_from_run(prep, all_results, delivery_dates, free_days, rate,
                                  num_bins, end_basis, customer)
     if customer and all_results:
+        lf = S.get("_loaded_from") or {}
         rec = add_to_history(
             customer, (S.get("version_name") or "").strip(), delivery_dates, events,
             kept, free_days, rate, num_bins, fixed, end_basis, filters, blanks, opts,
+            based_on=(lf.get("version", "") if lf.get("customer") == customer else ""),
         )
         snapshot["saved_msg"] = f"✅ Saved to history under **{customer}** as _{rec['version']}_"
         _toast(f"Saved to history — {customer} · {rec['version']}", "✅")
@@ -4153,6 +4212,7 @@ def _md5_short(txt):
 
 def history_table(filtered, show_days):
     rows = []
+    any_dry = any(rec_dry_total(x) for x in filtered)
     for h in filtered:
         dts = _record_disposal_dates(h)
         if "delivery_dates" in h:
@@ -4174,7 +4234,7 @@ def history_table(filtered, show_days):
         row["Max fee"] = rec_ext_total(h, "max_total")
         if show_days:
             row["Max days"] = int(h.get("max_ext_days") or 0)
-        if any(rec_dry_total(x) for x in filtered):
+        if any_dry:
             row["Dry run fees"] = rec_dry_total(h)
         row["Logged"] = h.get("logged_at", "—")
         rows.append(row)
@@ -4200,31 +4260,60 @@ def history_table(filtered, show_days):
         return []
 
 
-def render_backup_panel(history):
-    with st.expander("💾 Backup & restore"):
-        extra = S.get("_browser_extra") or []
-        st.caption(
-            f"Runs on the server: **{len(history):,}** · runs only this device remembers: **{len(extra):,}**. "
-            "Every run is also copied into this browser, so it survives the app sleeping, a server restart "
-            "or the device being switched off. A downloaded file also survives clearing the browser.")
-        if extra:
-            st.warning(f"{len(extra)} run(s) are in this device's backup but not on the server "
-                       "(the server's file may have been reset, or another device deleted them).")
-            st.button(f"Restore {len(extra)} run(s) from this device", key="restore_device",
-                      on_click=restore_device_runs_cb)
-        st.download_button("⬇ Download all runs (.json)", data=json.dumps(history, indent=2, default=str),
-                           file_name=f"bin_calc_history_{yymmdd(today_guam())}.json", mime="application/json",
-                           key="hist_download")
-        up = st.file_uploader("Import a downloaded backup (adds runs that are missing)", type="json",
-                              key="hist_import")
-        if up is not None and S.get("_imported_id") != up.file_id:
-            S["_imported_id"] = up.file_id
-            try:
-                added = import_runs(json.loads(up.getvalue().decode("utf-8")))
-                S["_flash"] = ("success", f"Imported {added} run(s) from {up.name}.")
-            except Exception as ex:
-                S["_flash"] = ("error", f"Could not import that file: {ex}")
-            st.rerun()
+def _all_runs_json():
+    """The whole history as one downloadable text (built only when the download is asked for)."""
+    return json.dumps(load_history(), indent=2, default=str)
+
+
+def _download_all_runs():
+    """Download button for the backup file. Building the file (every run, indented) took ~0.4 s on every visit to the
+    History page, so it is only built when the button is clicked (Streamlit's deferred download). On a Streamlit too old
+    for that, a 'Prepare' button builds it on demand instead."""
+    name = f"bin_calc_history_{yymmdd(today_guam())}.json"
+    if "callable" in (getattr(st.download_button, "__doc__", "") or ""):
+        st.download_button("⬇ Download all runs (.json)", data=_all_runs_json, file_name=name,
+                           mime="application/json", key="hist_download")
+    elif S.get("_prep_dl"):
+        st.download_button("⬇ Download all runs (.json)", data=_all_runs_json(), file_name=name,
+                           mime="application/json", key="hist_download")
+    else:
+        st.button("Prepare the backup file", key="hist_prepare", on_click=lambda: S.__setitem__("_prep_dl", True))
+
+
+def render_backup_panel(history, boxed=True):
+    if boxed:
+        with st.expander("💾 Backup & restore"):
+            _backup_panel_body(history)
+    else:
+        _backup_panel_body(history)
+
+
+def _backup_panel_body(history):
+    extra = S.get("_browser_extra") or []
+    st.caption(
+        f"Runs on the server: **{len(history):,}** · runs only this device remembers: **{len(extra):,}**. "
+        "Every run is also copied into this browser, so it survives the app sleeping, a server restart "
+        "or the device being switched off. A downloaded file also survives clearing the browser.")
+    if extra:
+        st.warning(f"{len(extra)} run(s) are in this device's backup but not on the server "
+                   "(the server's file may have been reset, or another device deleted them).")
+        st.button(f"Restore {len(extra)} run(s) from this device", key="restore_device",
+                  on_click=restore_device_runs_cb)
+    _download_all_runs()
+    up = st.file_uploader("Import a downloaded backup (adds runs that are missing)", type="json",
+                          key="hist_import")
+    if up is not None and S.get("_imported_id") != up.file_id:
+        S["_imported_id"] = up.file_id
+        try:
+            added = import_runs(json.loads(up.getvalue().decode("utf-8")))
+            S["_flash"] = ("success", f"Imported {added} run(s) from {up.name}.")
+        except Exception as ex:
+            S["_flash"] = ("error", f"Could not import that file: {ex}")
+        st.rerun()
+
+
+HIST_TOOLS = ["None", "🧾 Work orders", "🔄 Re-run with new terms", "⚖️ Compare", "📄 Raw JSON", "🗑️ Delete runs",
+              "💾 Backup & restore"]
 
 
 def render_history(show_days):
@@ -4276,7 +4365,13 @@ def render_history(show_days):
     rec = next(h for h in filtered if h["id"] == sel_id)
     render_static_view_of_record(rec, show_days)
 
-    with st.expander("🔄 Re-run with new rental terms"):
+    # Each of these is built only when you pick it. (Six collapsed sections used to be built on every visit to this page -
+    # tables, pick-lists, the whole run as JSON - which made the page slower to appear for things that are rarely used.)
+    tool = st.radio("Tools for this run", HIST_TOOLS, horizontal=True, key="hist_tool",
+                    help="Pick one to open it below. Nothing is loaded until you do, which keeps this page quick.")
+    if tool == HIST_TOOLS[1]:
+        st.dataframe(record_events_df(parse_record_to_calc_inputs(rec)), hide_index=True, **STRETCH)
+    if tool == HIST_TOOLS[2]:
         st.write("Try different free-day allowances or rates without changing the saved run.")
         rc1, rc2 = st.columns(2)
         with rc1:
@@ -4290,7 +4385,7 @@ def render_history(show_days):
         if st.button("Re-run with new terms", key=f"rerun_{sel_id}"):
             render_rerun_results(rec, new_free_days, new_rate, show_days)
 
-    with st.expander("⚖️ Compare with another run"):
+    if tool == HIST_TOOLS[3]:
         other_ids = [i for i in labels if i != sel_id]
         if not other_ids:
             st.info("Need at least 2 runs in this list to compare.")
@@ -4300,10 +4395,10 @@ def render_history(show_days):
             if st.button("Show comparison", key=f"comp_btn_{sel_id}"):
                 render_record_comparison(rec, next(h for h in filtered if h["id"] == other_id), show_days)
 
-    with st.expander("📄 Raw JSON"):
+    if tool == HIST_TOOLS[4]:
         st.json(rec)
 
-    with st.expander("🗑️ Delete runs"):
+    if tool == HIST_TOOLS[5]:
         st.caption("Nothing is deleted until you pick runs. To clear everything, choose "
                    "**(all customers)** and **(all runs)**.")
         dc1, dc2 = st.columns([1, 2])
@@ -4324,7 +4419,8 @@ def render_history(show_days):
         if st.button(f"🗑️ Delete {len(ids):,} run(s)", disabled=not ids, key="del_go"):
             confirm_delete_dialog(ids, f"{len(ids):,} run(s) of {who}")
 
-    render_backup_panel(history)
+    if tool == HIST_TOOLS[6]:
+        render_backup_panel(history, boxed=False)
     pending = S.pop("_pending_reload", None)
     if pending:
         confirm_reload_dialog(pending)
@@ -4428,6 +4524,15 @@ def inject_css():
         }}
         .st-key-app_header [data-testid="stRadio"] label:has(input:checked) p {{ color: #fff; font-weight: 600; }}
         [data-testid="stTooltipContent"] {{ max-width: min(22rem, 88vw) !important; }}
+        /* pop-up messages (saved / not saved / not calculated) appear in the middle of the window */
+        [data-testid="stToastContainer"] {{
+            position: fixed !important; top: 50% !important; left: 50% !important; right: auto !important; bottom: auto !important;
+            transform: translate(-50%, -50%) !important; width: auto !important; max-width: min(34rem, 92vw) !important;
+            z-index: 1000003 !important; align-items: center !important; justify-content: center !important;
+        }}
+        [data-testid="stToast"] {{ box-shadow: 0 10px 34px rgba(0,0,0,.30) !important; min-width: 20rem !important;
+                                   font-size: 1.25rem !important; padding: .9rem 1.1rem !important; }}
+        [data-testid="stToast"] * {{ font-size: inherit !important; }}
         /* blocking problems: a red box whose lines jump to the cell */
         .bin-err-box {{ background: {"rgba(255,75,75,.14)" if dark else "#ffe9e9"}; border: 1px solid {"rgba(255,75,75,.55)" if dark else "#ffb3b3"};
                         border-radius: .5rem; padding: .6rem .9rem; margin: .4rem 0; color: {"#ffb4b4" if dark else "#7a1f1f"}; }}
@@ -4483,8 +4588,21 @@ _HELPER_HTML = """<script>
     if (!btn.disabled) btn.click();
   }, true);
 
+  // ---- Backspace on a selected table cell clears it, exactly like Delete does ----
+  on(doc, 'keydown', function (e) {
+    if (e.key !== 'Backspace' || e.ctrlKey || e.metaKey || e.altKey) return;
+    var t = e.target;
+    if (!t || !t.closest || !t.closest('.st-key-events_tbl [data-testid="stDataFrame"]')) return;
+    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;       // typing inside a cell editor
+    if (doc.querySelector('#portal .gdg-clip-region')) return;                                  // a cell editor / dropdown is open
+    e.preventDefault(); e.stopPropagation();
+    t.dispatchEvent(new KeyboardEvent('keydown', {key: 'Delete', code: 'Delete', keyCode: 46, which: 46, bubbles: true, cancelable: true}));
+  }, true);
+
   // ---- the 📌 pin button: top-left corner of the OPEN sidebar (where the « / » button of a collapsed sidebar is) ----
-  // Pinned = while the sidebar is open and there is room for both, the page is moved over by the amount the sidebar covers.
+  // Pinned = the sidebar STAYS OPEN: its collapse arrow is locked (dimmed), anything that closes it is undone at once, and
+  // while there is room for both the page is moved over by the amount the sidebar covers. Unpinned = Streamlit's own
+  // behaviour (the arrow collapses it; on a narrow window a click on the page closes it).
   // The on/off state is kept in this browser (localStorage), so toggling it never reruns the app. The button sits in a
   // zero-height sticky strip INSIDE the sidebar's scroll container: it stays visible while the sidebar is scrolled, and
   // a click on it counts as "inside the sidebar" (Streamlit closes a narrow-window sidebar on any click outside it).
@@ -4504,8 +4622,8 @@ _HELPER_HTML = """<script>
     'border-radius:4px;cursor:pointer;font-size:9px;line-height:1;color:inherit;';
   function paintPin() {
     pbtn.setAttribute('aria-pressed', pinOn ? 'true' : 'false');
-    pbtn.title = pinOn ? 'Pinned: while there is room, the page moves over so the sidebar never covers it. Click to unpin.'
-                       : 'Pin: while there is room, move the page over so the sidebar never covers it.';
+    pbtn.title = pinOn ? 'Pinned open: the sidebar stays open (its collapse arrow is locked) and the page moves over so it is never covered. Click to unpin.'
+                       : 'Pin the sidebar open: it stays open and the page moves over so it is never covered.';
     pbtn.style.background = pinOn ? 'rgba(128,128,128,.40)' : 'transparent';
     pbtn.style.border = pinOn ? '1px solid rgba(128,128,128,.9)' : '1px solid rgba(128,128,128,.45)';
     pbtn.style.opacity = pinOn ? '1' : '.65';
@@ -4515,9 +4633,19 @@ _HELPER_HTML = """<script>
   pstyle = doc.createElement('style'); pstyle.id = 'bin-pin-style';
   pstyle.textContent = '[data-testid="stMain"]{margin-left:var(--bin-pin-shift,0px) !important;' +
     'width:calc(100% - var(--bin-pin-shift,0px)) !important;min-width:0 !important;}';
+  var lstyle = doc.getElementById('bin-pin-lock'); if (lstyle) lstyle.remove();
+  lstyle = doc.createElement('style'); lstyle.id = 'bin-pin-lock';
+  lstyle.textContent = '[data-testid="stSidebarCollapseButton"] button{opacity:.3 !important;cursor:not-allowed !important;}';
+  function reopen() {                                    // while pinned a closed sidebar is opened again
+    if (!pinOn || sidebarOpen()) return;
+    var ex = doc.querySelector('[data-testid="stExpandSidebarButton"]');
+    if (ex) { var bt = ex.tagName === 'BUTTON' ? ex : (ex.querySelector('button') || ex); bt.click(); }
+  }
   function fitPin() {
     var sb = sidebarEl(), mn = doc.querySelector('[data-testid="stMain"]');
     if (!sb || !mn) return;
+    if (pinOn) { if (!lstyle.parentNode) doc.head.appendChild(lstyle); reopen(); }
+    else if (lstyle.parentNode) lstyle.remove();
     if (!pinOn) { doc.documentElement.style.removeProperty('--bin-pin-shift'); if (pstyle.parentNode) pstyle.remove(); return; }
     if (!pstyle.parentNode) doc.head.appendChild(pstyle);
     doc.documentElement.style.setProperty('--bin-pin-shift', '0px');
@@ -4529,6 +4657,17 @@ _HELPER_HTML = """<script>
     }
     doc.documentElement.style.setProperty('--bin-pin-shift', shift + 'px');
   }
+  on(doc, 'click', function (e) {                        // the collapse arrow does nothing while pinned (and says why)
+    if (!pinOn) return;
+    var t = e.target && e.target.closest ? e.target.closest('[data-testid="stSidebarCollapseButton"]') : null;
+    if (!t) return;
+    e.preventDefault(); e.stopPropagation();
+    var r = t.getBoundingClientRect();
+    showTip('Pinned open. Click the pin to unpin, then collapse.', r.right + 8, r.top, false);
+    tipLock = Date.now() + 2600;
+    setTimeout(function () { if (Date.now() >= tipLock - 50) TIP.style.display = 'none'; }, 2700);
+  }, true);
+  on(doc, 'mouseup', function () { if (pinOn) { setTimeout(reopen, 80); setTimeout(reopen, 450); } }, true);
   pbtn.onclick = function (e) {
     e.stopPropagation();
     pinOn = !pinOn; try { W.localStorage.setItem('bin_calc_pin_sidebar', pinOn ? '1' : '0'); } catch (x) {}
@@ -4557,6 +4696,7 @@ _HELPER_HTML = """<script>
     W.clearInterval(ppt); W.clearInterval(fpt);
     if (pwrap) pwrap.remove();
     if (pstyle.parentNode) pstyle.remove();
+    if (lstyle.parentNode) lstyle.remove();
     doc.documentElement.style.removeProperty('--bin-pin-shift');
   });
 
@@ -4864,7 +5004,7 @@ _HELPER_HTML = """<script>
 # ──────────────────────────────────────────────
 _STORE_HTML = """<!doctype html><html><body><script>
 (function () {
-  var KH = "bin_calc_history_v1", KW = "bin_calc_work_v1", reported = false;
+  var KH = "bin_calc_history_v1", KW = "bin_calc_work_v1", reported = false, acked = false;
   function post(type, data) {
     window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data || {}), "*");
   }
@@ -4879,6 +5019,11 @@ _STORE_HTML = """<!doctype html><html><body><script>
     if (!reported) {
       reported = true;
       post("streamlit:setComponentValue", {value: {ok: true, hist: get(KH), work: get(KW)}, dataType: "json"});
+    } else if (a.ack && !acked) {
+      // The app has taken the stored data. A component's value is sent back to the server with EVERY rerun, so replace the
+      // (large) payload by a tiny value: otherwise each click uploads the whole history again.
+      acked = true;
+      post("streamlit:setComponentValue", {value: {ok: true, done: true}, dataType: "json"});
     }
   });
   post("streamlit:componentReady", {apiVersion: 1});
@@ -5081,12 +5226,15 @@ def persist_to_browser():
     """Mount the (invisible) store; once it has reported, keep it up to date."""
     args = {}
     if S.get("_browser_ready"):
-        args["work"] = json.dumps({
-            "rows": state_snap()["rows"], "default": bool(S.get("rows_default")),
-            "undo": S.get("undo", [])[-MAX_UNDO_SAVED:], "redo": S.get("redo", [])[-MAX_UNDO_SAVED:],
-            "settings": settings_snap(),
-            "saved": now_guam().isoformat(timespec="seconds"),
-        }, separators=(",", ":"), default=str)
+        args["ack"] = True
+        core = {"rows": state_snap()["rows"], "default": bool(S.get("rows_default")),
+                "undo": S.get("undo", [])[-MAX_UNDO_SAVED:], "redo": S.get("redo", [])[-MAX_UNDO_SAVED:],
+                "settings": settings_snap()}
+        wsig = hashlib.md5(json.dumps(core, separators=(",", ":"), default=str).encode()).hexdigest()
+        if wsig != S.get("_work_sig"):       # only send the working copy when it changed (not on every rerun)
+            S["_work_sig"] = wsig
+            args["work"] = json.dumps(dict(core, saved=now_guam().isoformat(timespec="seconds")),
+                                      separators=(",", ":"), default=str)
         extra = S.get("_browser_extra") or []
         sig = (_history_sig(), len(extra))
         if sig != S.get("_hist_sig_sent"):
@@ -5145,6 +5293,8 @@ if page_changed:  # coming back to a page: re-seed its grids from SSOT
     S["tbl_rev"] = -1
     S["pick_rev"] = -1
     S["_prev_page"] = page
+    if page == NAV_HIST:
+        S["hist_tool"] = "None"           # the History page always opens light: no tool is built until one is picked
 
 # Streamlit forgets a widget's value when the widget is not drawn in a run, and the
 # browser blanks it. Only one page is drawn at a time, so re-assert the keyed widgets'
@@ -5153,7 +5303,7 @@ if page_changed:  # coming back to a page: re-seed its grids from SSOT
 _KEEP = {
     NAV_CALC: ["customer_name", "version_name", "staggered", "delivery_single", "input_mode"]
     + [f"delivery_bin_{b}" for b in range(1, 6)],
-    NAV_HIST: ["hist_customer", "hist_n", "hist_run"],
+    NAV_HIST: ["hist_customer", "hist_n", "hist_run", "hist_tool"],
 }
 for _page, _keys in _KEEP.items():
     if _page != page or page_changed:
